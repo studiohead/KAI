@@ -68,6 +68,7 @@ static void cmd_hex(const char *args, ai_session_t *session);
 static void cmd_mem(const char *args, ai_session_t *session);
 static void cmd_echo(const char *args, ai_session_t *session);
 static void cmd_sandbox(const char *args, ai_session_t *session);
+static void cmd_pipeline(const char *args, ai_session_t *session);
 
 /* ---- Command table --------------------------------------------------- */
 static const command_t commands[] = {
@@ -78,6 +79,7 @@ static const command_t commands[] = {
     { "mem",   "Print BSS and stack addresses",   cmd_mem   },
     { "echo",  "Echo text back to the terminal",  cmd_echo  },
     { "sandbox", "Run a sandboxed tool call", cmd_sandbox },
+    { "pipeline", "Run a multi-step AIQL pipeline", cmd_pipeline },
 };
 
 #define NUM_COMMANDS  (sizeof(commands) / sizeof(commands[0]))
@@ -156,6 +158,21 @@ static void cmd_sandbox(const char *args, ai_session_t *session)
     sandbox_execute(&sb_ctx, args);
 }
 
+static void cmd_pipeline(const char *args, ai_session_t *session)
+{
+    if (!args || args[0] == '\0') {
+        sys_uart_write("usage: pipeline <step1>; <step2>; ...\n",
+                       KSTRLEN("usage: pipeline <step1>; <step2>; ...\n"),
+                       session->caps);
+        sys_uart_write("  e.g: pipeline el -> level; echo done\n",
+                       KSTRLEN("  e.g: pipeline el -> level; echo done\n"),
+                       session->caps);
+        return;
+    }
+
+    sandbox_run_pipeline(&sb_ctx, args);
+}
+
 /* Print help for all commands (ASCII dash to avoid UTF-8 mismatch) */
 static void cmd_help(const char *args, ai_session_t *session)
 {
@@ -214,24 +231,18 @@ void kernel_main(void)
 
     sandbox_init(&sb_ctx, session.caps);
 
-    /* Clear screen and print banner */
-    const char top[]    = "========\n";
-    const char middle[] = "      Kernel AI OS      \n";
-    const char bottom[] = "========\n";
+    /* Normal banner */
+    sys_uart_write("========================\n", 26, session.caps);
+    sys_uart_write("      Kernel AI OS      \n", 26, session.caps);
+    sys_uart_write("========================\n", 26, session.caps);
 
-    sys_uart_write(top,    k_strlen(top),    session.caps);
-    sys_uart_write(middle, k_strlen(middle), session.caps);
-    sys_uart_write(bottom, k_strlen(bottom), session.caps);
-
-    /* Print "EL: X   |   Type 'help' for commands" manually */
     sys_uart_write("EL: ", 4, session.caps);
     char el_char = '0' + (char)current_el();
     sys_uart_write(&el_char, 1, session.caps);
     sys_uart_write("   |   Type 'help' for commands\n",
-               KSTRLEN("   |   Type 'help' for commands\n"),
-               session.caps);
+                   KSTRLEN("   |   Type 'help' for commands\n"),
+                   session.caps);
 
-    /* Print the input prompt */
     sys_uart_write(PROMPT, KSTRLEN(PROMPT), session.caps);
 
     /* ---- Main input loop ---- */
@@ -256,6 +267,5 @@ void kernel_main(void)
             buf[index++] = c;
             sys_uart_write(&c, 1, session.caps);
         }
-        /* Non-printable characters are ignored */
     }
 }

@@ -38,16 +38,22 @@ int sys_uart_write(const char *buf, size_t len, uint32_t caller_caps)
     if (!buf || len == 0)
         return -1;
 
-    for (size_t i = 0; i < len; i++) {
-        unsigned char c = (unsigned char)buf[i];
+    const char *p = buf;
+    const char * const end = buf + len;
 
-        /* Reject DEL and non-printable bytes except allowed whitespace */
+    while (p < end)
+    {
+        const unsigned char c = (unsigned char)*p;
+
         if (c == 0x7FU)
             return -1;
+
         if (c < 0x20U && c != '\n' && c != '\r' && c != '\t' && c != '\b')
             return -1;
 
         uart_putc((char)c);
+
+        ++p;
     }
 
     return (int)len;

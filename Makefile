@@ -69,8 +69,7 @@ QEMU       := qemu-system-aarch64
 QEMU_FLAGS := \
     -M virt                 \
     -cpu max                \
-    -display none           \
-    -serial stdio           \
+    -nographic              \
     -kernel $(ELF)
 
 # ============================================================================
