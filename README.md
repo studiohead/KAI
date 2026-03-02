@@ -1,8 +1,8 @@
-# KAI OS — Kernel AI Operating System
+# KAI — Kernel AI Operating System
 
-<i>How do you give an AI model meaningful control over a system without giving it arbitrary code execution? That sounds like chaos.</i>
+<i>How do you give an AI model meaningful control over a system without giving it arbitrary code execution?</i>
  
-KAI OS is a formally verified, capability-gated, pipeline-based command language that sits between the AI and the hardware. The AI can only do what the verifier permits, and the verifier runs before any execution. This is architecturally cleaner than sandboxing approaches that restrict after the fact.
+KAI is a formally verified, capability-gated, pipeline-based command language that sits between the AI and the hardware. The AI can only do what the verifier permits, and the verifier runs before any execution. This is architecturally cleaner than sandboxing approaches that restrict after the fact.
 
 ---
 
