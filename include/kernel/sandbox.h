@@ -120,6 +120,7 @@ typedef struct {
 } var_store_t;
 
 /* ---- Pipeline (maps to AIQL PipelineStatement) -------------------------- */
+/* pipeline_t fully defined here */
 typedef struct {
     pipeline_node_t steps[PIPELINE_MAX_STEPS];
     uint32_t        step_count;
@@ -146,18 +147,35 @@ typedef enum {
 } sandbox_result_t;
 
 /* ---- Sandbox context ----------------------------------------------------- */
+/* Need intent_object_t pointer */
+#include "intent.h"
+typedef struct intent_object intent_object_t;
+
 typedef struct {
-    uint32_t    caps;
-    uint32_t    insn_count;
-    uint8_t     scratch[SANDBOX_SCRATCH_SIZE];
-    size_t      scratch_used;
-    var_store_t vars;            /* Named variable bindings (pipeline state) */
+
+    /* ---- Intent binding ---- */
+    intent_object_t *intent;
+
+    /* ---- Capability isolation ---- */
+    uint32_t caps;
+
+    /* ---- Hard execution limits ---- */
+    uint32_t instruction_budget;
+    uint32_t instruction_count;
+
+    /* ---- Private isolated memory ---- */
+    uint8_t scratch[SANDBOX_SCRATCH_SIZE];
+    size_t  scratch_used;
+
+    /* ---- Intent-local variables ---- */
+    var_store_t vars;
+
 } sandbox_ctx_t;
 
 /* ---- Public API ---------------------------------------------------------- */
 
 /* Initialise context. Must be called before any execute/run call. */
-void sandbox_init(sandbox_ctx_t *ctx, uint32_t caps);
+void sandbox_init(sandbox_ctx_t *ctx, intent_object_t *intent);
 
 /* Single-shot: parse one tool call, verify, execute. */
 sandbox_result_t sandbox_execute(sandbox_ctx_t *ctx, const char *input);

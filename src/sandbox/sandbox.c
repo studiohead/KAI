@@ -18,8 +18,8 @@
  * address-whitelisted before any byte is touched. Capability checks
  * happen at verify time, before execution begins.
  */
-
 #include <kernel/sandbox.h>
+#include <kernel/intent.h> 
 #include <kernel/syscall.h>
 #include <kernel/string.h>
 #include <stdint.h>
@@ -28,11 +28,23 @@
 /* ======================================================================
  * sandbox_init
  * ====================================================================== */
-void sandbox_init(sandbox_ctx_t *ctx, uint32_t caps)
+void sandbox_init(sandbox_ctx_t *ctx, intent_object_t *intent)
 {
-    if (!ctx) return;
+    if (!ctx || !intent) return;
+
     k_memset(ctx, 0, sizeof(sandbox_ctx_t));
-    ctx->caps = caps;
+
+    ctx->intent = intent;
+    ctx->caps = intent->caps;
+    ctx->instruction_budget = intent->instruction_budget;
+
+    // clear scratch buffer
+    for (size_t i = 0; i < SANDBOX_SCRATCH_SIZE; i++)
+        ctx->scratch[i] = 0;
+
+    // clear variable store
+    for (size_t i = 0; i < VAR_STORE_SIZE; i++)
+        ctx->vars.entries[i].set = false;
 }
 
 /* ======================================================================

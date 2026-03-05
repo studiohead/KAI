@@ -4,6 +4,30 @@
  
 KAI is a formally verified, capability-gated, pipeline-based command language that sits between the AI and the hardware. The AI can only do what the verifier permits, and the verifier runs before any execution. This is architecturally cleaner than sandboxing approaches that restrict after the fact.
 
+# Table of Contents
+
+- [KAI — Kernel AI Operating System](#kai-—-kernel-ai-operating-system)
+- [Features](#features)
+- [Project Layout](#project-layout)
+- [Requirements](#requirements)
+- [Build & Run](#build-and-run)
+- [Shell Commands](#shell-commands)
+- [Sandbox Tool Calls](#sandbox-tool-calls)
+- [AIQL Pipeline Execution](#aiql-pipeline-execution)
+- [Capability Flags](#capability-flags)
+- [Safety Design](#safety-design)
+- [AIQL Integration](#aiql-integration)
+- [KAI as the Robot Brain](#kai-as-the-robot-brain)
+  - [1. Cognitive Core](#1-cognitive-core)
+  - [2. Perception → Thought → Action](#2-perception-→-thought-→-action)
+  - [3. Memory and Variable Store](#3-memory-and-variable-store)
+  - [4. Conditional Planning](#4-conditional-planning)
+  - [5. Safe Motor Commands](#5-safe-motor-commands)
+  - [6. Example Cognitive Pipeline](#6-example-cognitive-pipeline)
+  - [7. Why This is Unique](#7-why-this-is-unique)
+- [Author](#author)
+- [License](#license)
+
 ---
 
 ## Features
@@ -70,7 +94,7 @@ kai_os/
 
 ---
 
-## Build & Run
+## Build and Run
 
 ```sh
 make            # build/kernel.elf + build/kernel.img
@@ -181,25 +205,150 @@ The default session starts with `CAP_MMIO | CAP_READ_MEM`.
 
 ## AIQL Integration
 
-The pipeline engine is derived from the [AIQL/PIQL](https://github.com/studiohead/AIQL) project.
-The following AST node types from the AIQL JSON schema are implemented natively in C:
+KAI's pipeline engine is derived from the **AIQL/PIQL AST schema**, providing unique control over safe AI execution:  
 
-| AIQL Schema Type       | KAI OS Implementation                         |
-|------------------------|-----------------------------------------------|
-| `PipelineStatement`    | `pipeline_t` — array of `pipeline_node_t`     |
-| `Operation`            | `pipeline_node_t` with `output_var` binding   |
-| `ConditionalStatement` | `OP_IF` with `then_count` / `else_count`      |
-| `BinaryExpression`     | `pipeline_cond_t` with `cmp_op_t`             |
-| `Variable`             | `var_entry_t` in `var_store_t`                |
-| `Literal`              | `uint64_t` inline in `operand_t`              |
+| AIQL Schema Type        | KAI OS Implementation                          |
+|-------------------------|-----------------------------------------------|
+| PipelineStatement       | `pipeline_t` — array of `pipeline_node_t`    |
+| Operation               | `pipeline_node_t` with `output_var` binding  |
+| ConditionalStatement    | `OP_IF` with `then_count` / `else_count`    |
+| BinaryExpression        | `pipeline_cond_t` with `cmp_op_t`           |
+| Variable                | `var_entry_t` in `var_store_t`               |
+| Literal                 | `uint64_t` inline in `operand_t`            |
 
-The following AIQL types are intentionally omitted as they require hosted
-environment capabilities (network, filesystem, display) unavailable at EL1:
+**What AIQL enables that KAI cannot do otherwise:**
 
-- `CallStatement` (model / visualize)
-- `LoadStatement`
+- Multi-step pipelines with **pre-execution verification**  
+- Step-wise **result binding** to named variables for later steps  
+- Conditional branching fully checked **before execution**  
+- Ensures AI cannot partially run dangerous sequences  
+- Integrates directly with kernel-level capabilities while **maintaining strict safety boundaries**  
+
+Certain AIQL AST types are intentionally omitted (require hosted OS capabilities):
+
+- CallStatement (model / visualize)  
+- LoadStatement (requires filesystem / network)  
 
 ---
+
+## KAI as the Robot Brain
+
+### 1. Cognitive Core
+
+KAI functions like a kernel-level AI brain, where:
+
+- **Perception:** Sensor inputs (distance, force, temperature) are read through verified memory regions.
+- **Planning:** AIQL pipelines represent “thought sequences” — multi-step plans with conditional logic.
+- **Decision Making:** Conditional branching allows AI to reason about environment, goals, and safety before acting.
+
+Basic human brain parallels:
+
+- Brainstem: enforces safety, basic reflexes, raw motor execution → KAI’s verified, capability-gated hardware control.
+
+- Cerebellum / basal ganglia: handles planning sequences, timing, and smooth execution → AIQL pipelines with pre-verified multi-step plans.
+
+- Cortex: higher reasoning, abstract thought → what a higher-level AI might implement on top of KAI.
+
+**Analogy:** Each AIQL pipeline is like a thought process or motor plan in a human brain. Variables store memory of previous sensory data or intermediate calculations.
+
+---
+
+### 2. Perception → Thought → Action
+
+**Flow:**
+
+**Perception:** Sensor readings are loaded into variables:
+
+```
+read 0x40000000 4 -> front_sensor
+read 0x40000004 4 -> left_sensor
+```
+
+
+**Internal Reasoning:** AIQL operations compute values or conditions:
+
+```
+if front_sensor < 10 -> then:2 else:1
+sensor_average = (front_sensor + left_sensor) / 2
+```
+
+**Decision / Action:** Outputs trigger actuator commands via verified capability calls:
+
+```
+write 0 0x02 # Move backward
+write 1 0x01 # Turn left
+```
+
+Each step is **pre-verified**, so the AI can plan multi-step sequences **without risk of unsafe execution**.
+
+---
+
+### 3. Memory and Variable Store
+
+- **Working Memory:** AIQL’s variable store acts like short-term memory for the robot brain.
+  - Each pipeline can store intermediate sensor readings, computations, or sub-plan results.
+  
+**Example:**
+
+```
+read 0x40001000 4 -> torque
+torque -> next_step if torque > threshold
+```
+
+- **Persistent Short-Term Memory:** Variables persist only for the pipeline duration, enforcing controlled cognition without allowing uncontrolled state mutations.
+
+---
+
+### 4. Conditional Planning
+
+- Conditional execution allows the AI to **reason about multiple outcomes** before acting:
+
+```
+if obstacle_detected -> then:2 else:1
+```
+
+- Branches map directly to safety or navigation choices.
+- AI can plan multi-step contingencies while remaining fully bounded by the **sandbox and capabilities**.
+
+---
+
+### 5. Safe Motor Commands
+
+- AI’s “muscles” are **capability-gated hardware writes**.
+  - Example: `CAP_MMIO` allows UART or motor register writes.
+- Sandbox ensures:
+  - Writes are restricted to **safe ranges**.
+  - Instruction count limits prevent runaway loops.
+  - No memory outside `ctx->scratch` or whitelisted MMIO regions is accessible.
+
+This ensures the **brain cannot override hardware safety rules**, even if AI miscalculates.
+
+---
+
+### 6. Example Cognitive Pipeline
+
+```
+pipeline read 0x40000000 4 -> front_sensor;
+read 0x40000004 4 -> left_sensor;
+if front_sensor < 10 -> then:2 else:1;
+write 0 0x02; # Move backward
+write 1 0x01; # Turn left
+echo step complete
+```
+
+- **Step 1:** Sense environment.
+- **Step 2:** Decide whether a corrective action is required.
+- **Step 3:** Execute motor commands.
+- **Step 4:** Feedback via `echo` (like reporting internal state).
+
+---
+
+### 7. Why This is Unique
+
+- **Formal pre-verification:** Every AI decision sequence is checked **before touching hardware**.
+- **Pipeline as thought:** Multi-step sequences with variable memory and conditional logic mimic a brain’s planning process.
+- **Bounded yet flexible:** AI can adapt to new inputs and recompute decisions without ever breaching safety.
+- **Minimal latency:** Running AIQL at kernel level avoids OS-level bottlenecks and context switching.
 
 ## Author
 

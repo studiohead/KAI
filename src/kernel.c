@@ -12,8 +12,9 @@
  */
 
 /* ---- Standard includes & helper macros -------------------------------- */
-#include <kernel/memory.h>
 #include <kernel/sandbox.h>
+#include <kernel/intent.h>
+#include <kernel/memory.h>
 #include <kernel/string.h>
 #include <kernel/syscall.h>
 #include <kernel/uart.h>
@@ -222,15 +223,25 @@ static void execute_command(const char *input, ai_session_t *session)
 /* ---- Entry point ----------------------------------------------------- */
 void kernel_main(void)
 {
+    /* ---- Initialize UART for console I/O ---- */
     uart_init();
 
+    /* ---- Create an AI session ---- */
     ai_session_t session = {
         .caps = CAP_MMIO | CAP_READ_MEM,
     };
 
-    sandbox_init(&sb_ctx, session.caps);
+    /* ---- Create an intent object for this session ---- */
+    intent_object_t intent = {
+        .caps = session.caps,
+        .instruction_budget = 1000,  /* Max instructions/pipeline steps */
+        .pipeline = NULL              /* No preloaded pipeline yet */
+    };
 
-    /* Normal banner */
+    /* ---- Initialize the sandbox with the intent ---- */
+    sandbox_init(&sb_ctx, &intent);
+
+    /* ---- Display welcome banner ---- */
     sys_uart_puts("========================\n", session.caps);
     sys_uart_puts("      Kernel AI OS      \n", session.caps);
     sys_uart_puts("========================\n", session.caps);
@@ -238,32 +249,50 @@ void kernel_main(void)
     sys_uart_puts("EL: ", session.caps);
     char el_char = '0' + (char)current_el();
     sys_uart_puts(&el_char, session.caps);
-    sys_uart_puts("   |   Type 'help' for commands\n",
-                   session.caps);
+    sys_uart_puts("   |   Type 'help' for commands\n", session.caps);
 
     sys_uart_write(PROMPT, KSTRLEN(PROMPT), session.caps);
 
-    /* ---- Main input loop ---- */
+    /* ---- Main input buffer ---- */
     char buf[CMD_BUF_SIZE];
     size_t index = 0U;
 
     while (true) {
-        char c = uart_getc();
+        char c = uart_getc();  /* blocking read from UART */
 
+        /* ---- Enter key: execute command ---- */
         if (c == '\r' || c == '\n') {
             buf[index] = '\0';
-            execute_command(buf, &session);
-            index = 0U;
+
+            /* Only execute if input is non-empty */
+            if (index > 0U) {
+                execute_command(buf, &session);
+                index = 0U;
+            }
+
+            /* Reset prompt */
+            sys_uart_write(PROMPT, KSTRLEN(PROMPT), session.caps);
         }
+
+        /* ---- Backspace handling ---- */
         else if ((c == '\x7F') || (c == '\x08')) {
             if (index > 0U) {
                 index--;
                 sys_uart_write("\b \b", KSTRLEN("\b \b"), session.caps);
             }
         }
+
+        /* ---- Printable characters ---- */
         else if (is_printable(c) && index < (CMD_BUF_SIZE - 1U)) {
             buf[index++] = c;
             sys_uart_write(&c, 1, session.caps);
+        }
+
+        /* ---- Safety: prevent buffer overflow ---- */
+        else if (index >= (CMD_BUF_SIZE - 1U)) {
+            sys_uart_write("\n[ERROR] input too long\n", KSTRLEN("\n[ERROR] input too long\n"), session.caps);
+            index = 0U;
+            sys_uart_write(PROMPT, KSTRLEN(PROMPT), session.caps);
         }
     }
 }

@@ -21,6 +21,7 @@
  */
 
 #include <kernel/sandbox.h>
+#include <kernel/intent.h>
 #include <kernel/syscall.h>
 #include <kernel/memory.h>
 #include <kernel/string.h>
@@ -439,8 +440,8 @@ sandbox_result_t interpreter_exec(ast_node_t *node, sandbox_ctx_t *ctx)
 {
     if (!node || !ctx) return SANDBOX_ERR_UNKNOWN;
 
-    if (ctx->insn_count >= SANDBOX_MAX_INSNS) return SANDBOX_ERR_LIMIT;
-    ctx->insn_count++;
+    if (ctx->instruction_count >= SANDBOX_MAX_INSNS) return SANDBOX_ERR_LIMIT;
+    ctx->instruction_count++;
 
     switch (node->opcode) {
 
@@ -536,13 +537,13 @@ sandbox_result_t interpreter_exec_pipeline(pipeline_t *pipeline,
     uint32_t i = 0;
 
     while (i < pipeline->step_count) {
-        if (ctx->insn_count >= SANDBOX_MAX_INSNS) return SANDBOX_ERR_LIMIT;
+        if (ctx->instruction_count >= SANDBOX_MAX_INSNS) return SANDBOX_ERR_LIMIT;
 
         pipeline_node_t *step = &pipeline->steps[i];
 
         /* ---- OP_IF: evaluate condition, skip branches ---------------- */
         if (step->opcode == OP_IF) {
-            ctx->insn_count++;
+            ctx->instruction_count++;
             bool cond_result = false;
             if (!eval_cond(&step->cond, &ctx->vars, &cond_result))
                 return SANDBOX_ERR_COND;
@@ -575,7 +576,7 @@ sandbox_result_t interpreter_exec_pipeline(pipeline_t *pipeline,
                     if (pipeline->steps[i].output_var[0] != '\0') {
                         if (!var_store_set(&ctx->vars,
                                            pipeline->steps[i].output_var,
-                                           (uint64_t)ctx->insn_count))
+                                           (uint64_t)ctx->instruction_count))
                             return SANDBOX_ERR_VAR;
                     }
                     i++;
@@ -602,7 +603,7 @@ sandbox_result_t interpreter_exec_pipeline(pipeline_t *pipeline,
                     if (pipeline->steps[i].output_var[0] != '\0') {
                         if (!var_store_set(&ctx->vars,
                                            pipeline->steps[i].output_var,
-                                           (uint64_t)ctx->insn_count))
+                                           (uint64_t)ctx->instruction_count))
                             return SANDBOX_ERR_VAR;
                     }
                     i++;
@@ -625,7 +626,7 @@ sandbox_result_t interpreter_exec_pipeline(pipeline_t *pipeline,
         /* Output binding */
         if (step->output_var[0] != '\0') {
             if (!var_store_set(&ctx->vars, step->output_var,
-                               (uint64_t)ctx->insn_count))
+                               (uint64_t)ctx->instruction_count))
                 return SANDBOX_ERR_VAR;
         }
 
