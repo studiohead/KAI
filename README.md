@@ -205,7 +205,7 @@ The default session starts with `CAP_MMIO | CAP_READ_MEM`.
 
 ## AIQL Integration
 
-KAI's pipeline engine is derived from the **AIQL/PIQL AST schema**, providing unique control over safe AI execution:  
+KAI's pipeline engine is derived from the **AIQL AST schema**, providing unique control over safe AI execution:  
 
 | AIQL Schema Type        | KAI OS Implementation                          |
 |-------------------------|-----------------------------------------------|
