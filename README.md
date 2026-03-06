@@ -2,7 +2,7 @@
 
 <i>How do you give an AI model meaningful control over a system without giving it arbitrary code execution?</i>
  
-KAI is a formally verified, capability-gated, pipeline-based command language that sits between the AI and the hardware. The AI can only do what the verifier permits, and the verifier runs before any execution. This is architecturally cleaner than sandboxing approaches that restrict after the fact.
+KAI is a formally verified, capability-gated, pipeline-based command language that sits between the AI and the hardware. More about AIQL here: https://github.com/studiohead/AIQL. The AI can only do what the verifier permits, and the verifier runs before any execution. This is architecturally cleaner than sandboxing approaches that restrict after the fact.
 
 # Table of Contents
 
