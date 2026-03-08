@@ -1,5 +1,4 @@
-// include/kernel/memory.h
-// KAI OS: Memory region whitelist for safe syscalls
+// include/kernel/memory.h — Memory region whitelist for KAI OS sandbox
 
 #ifndef KAI_MEMORY_H
 #define KAI_MEMORY_H
@@ -11,41 +10,34 @@
 extern "C" {
 #endif
 
-// -----------------------------------------------------------------------------
-// Memory region structure
-// Defines a start (inclusive) and end (exclusive) for a safe memory range
-// -----------------------------------------------------------------------------
+#define MEMORY_REGION_MAX 8   /* maximum number of whitelisted regions */
+
 typedef struct {
-    uintptr_t start;
-    uintptr_t end;
+    uintptr_t start;   /* inclusive */
+    uintptr_t end;     /* exclusive */
 } mem_region_t;
 
-// -----------------------------------------------------------------------------
-// Symbols from the linker defining BSS and stack
-// These are used to allow safe reads/writes only in whitelisted regions
-// -----------------------------------------------------------------------------
-extern char __bss_start[];
-extern char __bss_end[];
-extern char __stack_bottom[];
-extern char __stack_top[];
+/* Populated at runtime by memory_init() */
+extern mem_region_t memory_regions[MEMORY_REGION_MAX];
+extern size_t       memory_region_count;
 
-// -----------------------------------------------------------------------------
-// Whitelisted memory regions
-// Add any additional safe regions here (shared buffers, MMIO if safe, etc.)
-// -----------------------------------------------------------------------------
-extern mem_region_t memory_regions[];
-extern const size_t memory_region_count;
+/* Must be called once from kernel_main before any sandbox use */
+void memory_init(void);
 
-// -----------------------------------------------------------------------------
-// Helper function: check if an address is in any allowed region
-// Returns 1 if allowed, 0 if not
-// -----------------------------------------------------------------------------
+/* Syscall declarations */
+int sys_mem_info(uintptr_t *bss_start, uintptr_t *bss_end,
+                 uintptr_t *stack_start, uintptr_t *stack_end,
+                 uint32_t caller_caps);
+
+int sys_mem_read(uintptr_t src_addr, void *dst_buf, size_t len,
+                 uint32_t caller_caps);
+
+/* Check if a single address falls within any whitelisted region */
 static inline int is_allowed_addr(uintptr_t addr)
 {
     for (size_t i = 0; i < memory_region_count; i++) {
-        if (addr >= memory_regions[i].start && addr < memory_regions[i].end) {
+        if (addr >= memory_regions[i].start && addr < memory_regions[i].end)
             return 1;
-        }
     }
     return 0;
 }
@@ -54,4 +46,4 @@ static inline int is_allowed_addr(uintptr_t addr)
 }
 #endif
 
-#endif // KAI_MEMORY_H
+#endif /* KAI_MEMORY_H */

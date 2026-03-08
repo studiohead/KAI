@@ -24,19 +24,6 @@
 #include <stddef.h>
 #include <stdbool.h>
 
-/* * Capability Bitmask Definitions 
- * These ensure the ai_session_t initialization below compiles and 
- * the verifier can correctly gate hardware access.
- */
-#ifndef CAP_MMIO
-#define CAP_MMIO       (1U << 0)
-#endif
-#ifndef CAP_READ_MEM
-#define CAP_READ_MEM   (1U << 1)
-#endif
-#ifndef CAP_UART_WRITE
-#define CAP_UART_WRITE (1U << 3)
-#endif
 
 /* External assembly function from src/arch/aarch64/mmu.S */
 extern void vbar_install(void);
@@ -263,6 +250,9 @@ void kernel_main(void)
     /* 1. UART Init */
     uart_init();
 
+    /* 2. Memory whitelist — must come before any sandbox or verifier use */
+    memory_init();
+
     /* 2. MMU Init */
     mmu_init();
     mmu_enable();
@@ -278,7 +268,7 @@ void kernel_main(void)
      * NOTE: If the kernel hangs here, the MMU mapping for the 
      * sandbox scratchpad (0x40400000) is likely missing.
      */
-    ai_session_t session = { .caps = CAP_MMIO | CAP_READ_MEM | CAP_UART_WRITE };
+    ai_session_t session = { .caps = CAP_MMIO | CAP_READ_MEM | CAP_WRITE_MEM | CAP_SYSTEM };
     intent_object_t intent = {
         .caps = session.caps,
         .instruction_budget = 1000,

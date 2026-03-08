@@ -211,7 +211,13 @@ bool interpreter_parse(const char *input, ast_node_t *out_node)
         }
         if (arg_len == 0) break;
 
-        safe_strcpy(out_node->args[argc], cursor, SANDBOX_ARG_MAX_LEN);
+        /* Copy exactly arg_len bytes — safe_strcpy copies until NUL which
+         * would include trailing args; we must stop at the token boundary. */
+        size_t copy_len = arg_len < SANDBOX_ARG_MAX_LEN - 1U
+                        ? arg_len : SANDBOX_ARG_MAX_LEN - 1U;
+        for (size_t k = 0; k < copy_len; k++)
+            out_node->args[argc][k] = cursor[k];
+        out_node->args[argc][copy_len] = '\0';
         cursor += arg_len;
         argc++;
     }
@@ -396,7 +402,12 @@ static bool parse_pipeline_step(const char *input, size_t len,
             arg_len++;
         }
         if (arg_len == 0) break;
-        safe_strcpy(out->args[argc], cursor, SANDBOX_ARG_MAX_LEN);
+        /* Copy exactly arg_len bytes to avoid including trailing tokens */
+        size_t copy_len = arg_len < SANDBOX_ARG_MAX_LEN - 1U
+                        ? arg_len : SANDBOX_ARG_MAX_LEN - 1U;
+        for (size_t k = 0; k < copy_len; k++)
+            out->args[argc][k] = cursor[k];
+        out->args[argc][copy_len] = '\0';
         cursor += arg_len;
         argc++;
     }
