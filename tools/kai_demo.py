@@ -185,14 +185,14 @@ DEMO_STEPS = [
     (
         "Step 7 — Sense and Report",
         "read environment",
-        "pipeline read 0x40200000 4; echo sense complete",
-        "Reading the scratch region and confirming the sensing cycle."
+        "pipeline read 0x40200000 4; echo sensed",
+        "Reading scratch — confirming last motor state."
     ),
     (
         "Step 8 — Idle",
         "complete cycle",
-        "pipeline sleep 100; echo cycle complete",
-        "Cycle complete. Sleeping briefly before next loop."
+        "pipeline sleep 100; echo idle",
+        "Cycle complete. Yielding briefly before next loop."
     ),
 ]
 
