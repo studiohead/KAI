@@ -33,26 +33,32 @@
 
 /* ---- Opcode capability requirements ------------------------------------- */
 static const uint32_t opcode_required_caps[OP_INVALID] = {
-    [OP_NOP]   = CAP_NONE,
-    [OP_READ]  = CAP_READ_MEM,
-    [OP_WRITE] = CAP_WRITE_MEM,
-    [OP_INFO]  = CAP_READ_MEM,
-    [OP_ECHO]  = CAP_MMIO,
-    [OP_EL]    = CAP_MMIO,
-    [OP_CAPS]  = CAP_MMIO,
-    [OP_IF]    = CAP_NONE,   /* Caps checked on branch body steps individually */
+    [OP_NOP]         = CAP_NONE,
+    [OP_READ]        = CAP_READ_MEM,
+    [OP_WRITE]       = CAP_WRITE_MEM,
+    [OP_INFO]        = CAP_READ_MEM,
+    [OP_ECHO]        = CAP_MMIO,
+    [OP_EL]          = CAP_MMIO,
+    [OP_CAPS]        = CAP_MMIO,
+    [OP_IF]          = CAP_NONE,   /* Caps checked on branch steps individually */
+    [OP_SLEEP]       = CAP_NONE,   /* Timing only — no privileged access        */
+    [OP_INTROSPECT]  = CAP_MMIO,   /* Prints MMIO map to UART                   */
+    [OP_WAIT_EVENT]  = CAP_NONE,   /* Yield stub — no privileged access         */
 };
 
 /* ---- Opcode expected argument counts ------------------------------------ */
 static const uint32_t opcode_expected_argc[OP_INVALID] = {
-    [OP_NOP]   = 0,
-    [OP_READ]  = 2,   /* address, length                       */
-    [OP_WRITE] = 2,   /* scratch offset, byte value            */
-    [OP_INFO]  = 0,
-    [OP_ECHO]  = 1,   /* string to print                       */
-    [OP_EL]    = 0,
-    [OP_CAPS]  = 0,
-    [OP_IF]    = 0,   /* Condition is in cond field, not args  */
+    [OP_NOP]        = 0,
+    [OP_READ]       = 2,   /* address, length                         */
+    [OP_WRITE]      = 2,   /* scratch offset, byte value              */
+    [OP_INFO]       = 0,
+    [OP_ECHO]       = 1,   /* string to print                         */
+    [OP_EL]         = 0,
+    [OP_CAPS]       = 0,
+    [OP_IF]         = 0,   /* Condition is in cond field, not args    */
+    [OP_SLEEP]      = 1,   /* milliseconds (0–10000)                  */
+    [OP_INTROSPECT] = 0,   /* No args — prints full MMIO map          */
+    [OP_WAIT_EVENT] = 0,   /* No args — yields until next event       */
 };
 
 /* ---- Helper: parse hex or decimal string to uint64 --------------------- */
@@ -163,7 +169,17 @@ bool verifier_check(const ast_node_t *node, uint32_t caps)
         case OP_INFO:
         case OP_EL:
         case OP_CAPS:
+        case OP_INTROSPECT:
+        case OP_WAIT_EVENT:
             break;
+
+        case OP_SLEEP: {
+            /* Clamp to a safe maximum — 10 seconds prevents runaway waits */
+            uint64_t ms;
+            if (!parse_uint64(node->args[0], &ms)) return false;
+            if (ms > 10000U) return false;  /* 10 000 ms = 10 s maximum   */
+            break;
+        }
 
         case OP_IF:
             /* OP_IF is valid in ast_node_t only structurally —
@@ -248,6 +264,16 @@ bool verifier_check_pipeline(const pipeline_t *pipeline, uint32_t caps)
             size_t len = k_strlen(step->args[0]);
             if (len == 0 || len >= SANDBOX_ARG_MAX_LEN) return false;
         }
+
+        /* OP_SLEEP: clamp to safe maximum */
+        if (step->opcode == OP_SLEEP) {
+            uint64_t ms;
+            if (!parse_uint64(step->args[0], &ms)) return false;
+            if (ms > 10000U) return false;
+        }
+
+        /* OP_INTROSPECT, OP_WAIT_EVENT, OP_NOP, OP_INFO, OP_EL, OP_CAPS:
+         * no opcode-specific argument validation needed */
     }
 
     return true;

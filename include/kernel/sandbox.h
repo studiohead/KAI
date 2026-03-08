@@ -54,8 +54,11 @@ typedef enum {
     OP_ECHO    = 4,   /* Write a string to UART                        */
     OP_EL      = 5,   /* Print current exception level                 */
     OP_CAPS    = 6,   /* Print current session capability mask         */
-    OP_IF      = 7,   /* Conditional branch (AIQL ConditionalStatement)*/
-    OP_INVALID = 8,   /* Sentinel — any value >= OP_INVALID is illegal */
+    OP_IF         = 7,  /* Conditional branch (AIQL ConditionalStatement) */
+    OP_SLEEP      = 8,  /* Busy-wait N milliseconds — robot timing/PWM    */
+    OP_INTROSPECT = 9,  /* Print whitelisted MMIO map as name:address pairs*/
+    OP_WAIT_EVENT = 10, /* Yield until next IRQ tick (stub; becomes async) */
+    OP_INVALID    = 11, /* Sentinel — any value >= OP_INVALID is illegal   */
 } sandbox_opcode_t;
 
 /* ---- Comparison operators (BinaryExpression operators from AIQL) -------- */
@@ -144,6 +147,7 @@ typedef enum {
     SANDBOX_ERR_UNKNOWN   = 6,   /* Unrecognised opcode              */
     SANDBOX_ERR_VAR       = 7,   /* Variable not found or store full */
     SANDBOX_ERR_COND      = 8,   /* Condition evaluation failed      */
+    SANDBOX_ERR_EL0       = 9,   /* EL0 execution fault              */
 } sandbox_result_t;
 
 /* ---- Sandbox context ----------------------------------------------------- */

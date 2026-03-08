@@ -3,8 +3,9 @@
  *
  * Defines the whitelisted memory regions used by syscalls to validate
  * addresses before allowing reads or writes. The linker symbols
- * __bss_start, __bss_end, __stack_bottom, __stack_top are defined in
- * scripts/linker.ld and resolved at link time.
+ * __bss_start, __bss_end, __stack_bottom, __stack_top, and the 
+ * sandbox scratchpad symbols are defined in scripts/linker.ld 
+ * and resolved at link time.
  *
  * Rule: headers declare, .c files define.
  * memory.h holds extern declarations; this file holds the actual definitions.
@@ -12,6 +13,8 @@
 
 #include <kernel/memory.h>
 #include <kernel/syscall.h>
+#include <stddef.h>
+#include <stdint.h>
 
 /* ---- Linker symbol references ----------------------------------------
  * Declared as char arrays — the correct freestanding way to reference
@@ -22,18 +25,18 @@ extern char __bss_start[];
 extern char __bss_end[];
 extern char __stack_bottom[];
 extern char __stack_top[];
+extern char __sandbox_scratch_start[];
+extern char __sandbox_scratch_end[];
 
 /* ---- Whitelisted memory regions --------------------------------------
  * Any address passed to sys_mem_read must fall within one of these
  * regions. Initialised at definition time from linker symbols — safe
  * because the linker resolves these before any C code runs.
- *
- * To add a sandbox scratch buffer later:
- *   { (uintptr_t)scratch_buf, (uintptr_t)(scratch_buf + SCRATCH_SIZE) },
  * -------------------------------------------------------------------- */
 mem_region_t memory_regions[] = {
-    { (uintptr_t)__bss_start,    (uintptr_t)__bss_end   },  /* BSS        */
-    { (uintptr_t)__stack_bottom, (uintptr_t)__stack_top },  /* Stack      */
+    { (uintptr_t)__bss_start,             (uintptr_t)__bss_end             }, /* BSS             */
+    { (uintptr_t)__stack_bottom,          (uintptr_t)__stack_top          }, /* Kernel Stack   */
+    { (uintptr_t)__sandbox_scratch_start, (uintptr_t)__sandbox_scratch_end }, /* Sandbox Scratch */
 };
 
 const size_t memory_region_count =
@@ -55,6 +58,7 @@ int sys_mem_info(uintptr_t *bss_start, uintptr_t *bss_end,
     if (!bss_start || !bss_end || !stack_start || !stack_end)
         return -1;
 
+    /* Populate with addresses resolved by the linker */
     *bss_start   = (uintptr_t)__bss_start;
     *bss_end     = (uintptr_t)__bss_end;
     *stack_start = (uintptr_t)__stack_bottom;
@@ -75,18 +79,22 @@ int sys_mem_read(uintptr_t src_addr, void *dst_buf, size_t len,
     if (!(caller_caps & CAP_READ_MEM))
         return -1;
 
-    /* NULL destination guard */
+    /* NULL destination guard and zero-length guard */
     if (!dst_buf || len == 0)
         return -1;
 
     /* Verify the entire requested range is within a whitelisted region.
-     * We check both start and end-1 to guard against wrap-around. */
+     * We check both start and end to guard against wrap-around. */
     uintptr_t src_end = src_addr + len;
-    if (src_end < src_addr)   /* overflow check */
+    
+    /* overflow check: if src_addr + len wrapped around the 64-bit space */
+    if (src_end < src_addr)
         return -1;
 
     int allowed = 0;
     for (size_t i = 0; i < memory_region_count; i++) {
+        /* Check if the entire requested range [src_addr, src_end) 
+         * fits inside the current region [start, end) */
         if (src_addr >= memory_regions[i].start &&
             src_end  <= memory_regions[i].end) {
             allowed = 1;
@@ -97,11 +105,16 @@ int sys_mem_read(uintptr_t src_addr, void *dst_buf, size_t len,
     if (!allowed)
         return -1;
 
-    /* Safe to copy */
+    /* * Safe to copy.
+     * Note: We use a manual byte-copy loop here to remain freestanding 
+     * and avoid dependencies on external memcpy implementations that 
+     * might not be aware of our memory attributes.
+     */
     const uint8_t *src = (const uint8_t *)src_addr;
     uint8_t       *dst = (uint8_t *)dst_buf;
-    for (size_t i = 0; i < len; i++)
+    for (size_t i = 0; i < len; i++) {
         dst[i] = src[i];
+    }
 
     return 0;
 }

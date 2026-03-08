@@ -137,6 +137,7 @@ const char *sandbox_result_str(sandbox_result_t result)
         case SANDBOX_ERR_UNKNOWN:  return "unknown error";
         case SANDBOX_ERR_VAR:      return "variable error";
         case SANDBOX_ERR_COND:     return "condition error";
+        case SANDBOX_ERR_EL0:      return "EL0 execution fault";
         default:                   return "unknown error";
     }
 }

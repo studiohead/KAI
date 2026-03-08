@@ -1,0 +1,22 @@
+# tools/examples/obstacle_avoid.kai
+#
+# Obstacle avoidance reflex pipeline.
+# Designed to be registered to a GPIO/sensor IRQ via irq_register_pipeline().
+#
+# When an obstacle is detected within 10 units:
+#   - Write motor command 0x02 (reverse) to scratch buffer offset 0
+#   - Write motor command 0x01 (turn left) to scratch buffer offset 1
+# Otherwise:
+#   - Write motor command 0x01 (forward) to offset 0
+
+read 0x40000000 4 -> front_sensor
+read 0x40000004 4 -> left_sensor
+
+if front_sensor < 10
+    then:
+        write 0 0x02
+        write 1 0x01
+        echo obstacle: reversing and turning
+    else:
+        write 0 0x01
+        echo path clear: moving forward

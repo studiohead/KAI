@@ -36,14 +36,17 @@ typedef struct {
 } opcode_entry_t;
 
 static const opcode_entry_t opcode_table[] = {
-    { "nop",   OP_NOP   },
-    { "read",  OP_READ  },
-    { "write", OP_WRITE },
-    { "info",  OP_INFO  },
-    { "echo",  OP_ECHO  },
-    { "el",    OP_EL    },
-    { "caps",  OP_CAPS  },
-    { "if",    OP_IF    },
+    { "nop",        OP_NOP        },
+    { "read",       OP_READ       },
+    { "write",      OP_WRITE      },
+    { "info",       OP_INFO       },
+    { "echo",       OP_ECHO       },
+    { "el",         OP_EL         },
+    { "caps",       OP_CAPS       },
+    { "if",         OP_IF         },
+    { "sleep",      OP_SLEEP      },
+    { "introspect", OP_INTROSPECT },
+    { "wait_event", OP_WAIT_EVENT },
 };
 
 #define OPCODE_TABLE_SIZE (sizeof(opcode_table) / sizeof(opcode_table[0]))
@@ -512,6 +515,85 @@ sandbox_result_t interpreter_exec(ast_node_t *node, sandbox_ctx_t *ctx)
             sys_uart_write("caps: ", 6, ctx->caps);
             sys_uart_hex64((uint64_t)ctx->caps, ctx->caps);
             sys_uart_write("\n", 1, ctx->caps);
+            break;
+
+        case OP_SLEEP: {
+            /*
+             * Busy-wait for the requested number of milliseconds.
+             *
+             * Uses the ARMv8 generic timer (CNTPCT_EL0) for a portable
+             * delay that doesn't depend on loop iteration count or CPU
+             * frequency assumptions.
+             *
+             * CNTFRQ_EL0 gives the timer frequency in Hz.
+             * ticks_per_ms = freq / 1000.
+             * We read the counter, add the required ticks, spin until
+             * CNTPCT_EL0 >= deadline.
+             */
+            uint64_t ms;
+            parse_uint64(node->args[0], &ms);
+
+            uint64_t freq;
+            __asm__ volatile ("mrs %0, cntfrq_el0" : "=r" (freq));
+            uint64_t ticks_per_ms = freq / 1000ULL;
+
+            uint64_t start;
+            __asm__ volatile ("mrs %0, cntpct_el0" : "=r" (start));
+            uint64_t deadline = start + ms * ticks_per_ms;
+
+            uint64_t now;
+            do {
+                __asm__ volatile ("mrs %0, cntpct_el0" : "=r" (now));
+            } while (now < deadline);
+            break;
+        }
+
+        case OP_INTROSPECT: {
+            /*
+             * Print the whitelisted MMIO address map so an LLM or
+             * operator can inspect what the sandbox is allowed to access.
+             *
+             * Format (one entry per line):
+             *   MMIO <friendly_name> : <hex_address>
+             *
+             * This gives an AI agent a self-description of its environment
+             * before it starts writing pipelines — "inspect before plan."
+             */
+            static const struct {
+                const char *name;
+                uintptr_t   addr;
+            } mmio_map[] = {
+                { "UART0_DR",     0x09000000UL },
+                { "UART0_FR",     0x09000018UL },
+                { "GICD_CTLR",    0x08000000UL },
+                { "GICC_IAR",     0x0801000CUL },
+                { "CNTPCT_EL0",   0x00000000UL }, /* system reg, not MMIO */
+            };
+            static const size_t mmio_map_count =
+                sizeof(mmio_map) / sizeof(mmio_map[0]);
+
+            sys_uart_write("MMIO map:\n", 10, ctx->caps);
+            for (size_t m = 0; m < mmio_map_count; m++) {
+                sys_uart_write("  ", 2, ctx->caps);
+                sys_uart_write(mmio_map[m].name,
+                               k_strlen(mmio_map[m].name), ctx->caps);
+                sys_uart_write(" : ", 3, ctx->caps);
+                sys_uart_hex64((uint64_t)mmio_map[m].addr, ctx->caps);
+                sys_uart_write("\n", 1, ctx->caps);
+            }
+            break;
+        }
+
+        case OP_WAIT_EVENT:
+            /*
+             * Yield stub — issues WFE (Wait For Event) once.
+             *
+             * In a full implementation this would suspend the pipeline
+             * until an event register is set by an IRQ handler, enabling
+             * asynchronous pipeline coordination without busy-waiting.
+             * For now it provides a single low-power yield point.
+             */
+            __asm__ volatile ("wfe");
             break;
 
         default:
