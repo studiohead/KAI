@@ -6,21 +6,40 @@
  * translation units; only their public headers are included here.
  *
  * This version adds AI session awareness:
- *  - Each session has a capabilities mask controlling which syscalls are allowed
- *  - Command handlers receive a session pointer
- *  - Syscalls now use session->caps instead of fixed SYS_CALL_CAPS
+ * - Each session has a capabilities mask controlling which syscalls are allowed
+ * - Command handlers receive a session pointer
+ * - Syscalls now use session->caps instead of fixed SYS_CALL_CAPS
  */
 
 /* ---- Standard includes & helper macros -------------------------------- */
 #include <kernel/sandbox.h>
 #include <kernel/intent.h>
 #include <kernel/memory.h>
+#include <kernel/mmu.h>
+#include <kernel/irq.h>
 #include <kernel/string.h>
 #include <kernel/syscall.h>
 #include <kernel/uart.h>
 #include <stdint.h>
 #include <stddef.h>
 #include <stdbool.h>
+
+/* * Capability Bitmask Definitions 
+ * These ensure the ai_session_t initialization below compiles and 
+ * the verifier can correctly gate hardware access.
+ */
+#ifndef CAP_MMIO
+#define CAP_MMIO       (1U << 0)
+#endif
+#ifndef CAP_READ_MEM
+#define CAP_READ_MEM   (1U << 1)
+#endif
+#ifndef CAP_UART_WRITE
+#define CAP_UART_WRITE (1U << 3)
+#endif
+
+/* External assembly function from src/arch/aarch64/mmu.S */
+extern void vbar_install(void);
 
 /* Helper to get string length for sys_uart_write without hardcoding */
 #define KSTRLEN(str) ((size_t)k_strlen(str))
@@ -34,7 +53,9 @@ typedef struct {
     uint32_t caps;                 /* Allowed syscalls / capabilities */
 } ai_session_t;
 
-/* ---- Sandbox context (file-scope so cmd_sandbox can access it) ------- */
+/* ---- Sandbox context (global so irq_dispatch can access it) ---------- */
+/* Using the global context allows hardware interrupts to share state 
+ * with the user shell, enabling 'reflexes' that the user can monitor. */
 static sandbox_ctx_t sb_ctx;
 
 /* ---- Command typedef must come first --------------------------------- */
@@ -69,17 +90,21 @@ static void cmd_mem(const char *args, ai_session_t *session);
 static void cmd_echo(const char *args, ai_session_t *session);
 static void cmd_sandbox(const char *args, ai_session_t *session);
 static void cmd_pipeline(const char *args, ai_session_t *session);
+static void cmd_irq(const char *args, ai_session_t *session);
+static void cmd_irq_bind(const char *args, ai_session_t *session);
 
 /* ---- Command table --------------------------------------------------- */
 static const command_t commands[] = {
-    { "help",  "Show this help text",             cmd_help  },
-    { "clear", "Clear the terminal screen",       cmd_clear },
-    { "el",    "Print current exception level",   cmd_el    },
-    { "hex",   "Print an example hex value",      cmd_hex   },
-    { "mem",   "Print BSS and stack addresses",   cmd_mem   },
-    { "echo",  "Echo text back to the terminal",  cmd_echo  },
-    { "sandbox", "Run a sandboxed tool call", cmd_sandbox },
-    { "pipeline", "Run a multi-step AIQL pipeline", cmd_pipeline },
+    { "help",     "Show this help text",                     cmd_help     },
+    { "clear",    "Clear the terminal screen",               cmd_clear    },
+    { "el",       "Print current exception level",           cmd_el       },
+    { "hex",      "Print an example hex value",              cmd_hex      },
+    { "mem",      "Print BSS and stack addresses",           cmd_mem      },
+    { "echo",     "Echo text back to the terminal",          cmd_echo     },
+    { "sandbox",  "Run a sandboxed tool call",               cmd_sandbox  },
+    { "pipeline", "Run a multi-step AIQL pipeline",          cmd_pipeline },
+    { "irq_init", "Enable CPU IRQ delivery (start reflexes)", cmd_irq      },
+    { "irq_bind", "Bind IRQ <num> to <pipeline>",            cmd_irq_bind },
 };
 
 #define NUM_COMMANDS  (sizeof(commands) / sizeof(commands[0]))
@@ -93,7 +118,7 @@ static void cmd_clear(const char *args, ai_session_t *session)
     sys_uart_write("\033[2J\033[H", KSTRLEN("\033[2J\033[H"), session->caps);
 }
 
-/* Print current exception level (freestanding, no snprintf) */
+/* Print current exception level */
 static void cmd_el(const char *args, ai_session_t *session)
 {
     (void)args;
@@ -101,20 +126,19 @@ static void cmd_el(const char *args, ai_session_t *session)
 
     char el_char = '0' + (char)current_el();
     sys_uart_write(&el_char, 1, session->caps);
-    sys_uart_write("\n", 1, session->caps);
+    sys_uart_write("\r\n", 2, session->caps);
 }
 
-/* ---- Print example 64-bit hex value (freestanding, sandbox-safe) ---- */
+/* Print example 64-bit hex value */
 static void cmd_hex(const char *args, ai_session_t *session)
 {
     (void)args;
-
     sys_uart_write("Example 64-bit hex value: ", KSTRLEN("Example 64-bit hex value: "), session->caps);
     sys_uart_hex64(0xDEADBEEFCAFEBABEULL, session->caps);
-    sys_uart_write("\n", 1, session->caps);
+    sys_uart_write("\r\n", 2, session->caps);
 }
 
-/* ---- Print memory info via syscalls, sandbox-safe ---- */
+/* Print memory info via syscalls */
 static void cmd_mem(const char *args, ai_session_t *session)
 {
     (void)args;
@@ -123,176 +147,191 @@ static void cmd_mem(const char *args, ai_session_t *session)
     if (sys_mem_info(&bss_start, &bss_end, &stack_start, &stack_end, session->caps) == 0) {
         sys_uart_write("BSS start   : ", KSTRLEN("BSS start   : "), session->caps);
         sys_uart_hex64(bss_start, session->caps);
-        sys_uart_write("\nBSS end     : ", KSTRLEN("\nBSS end     : "), session->caps);
+        sys_uart_write("\r\nBSS end     : ", KSTRLEN("\r\nBSS end     : "), session->caps);
         sys_uart_hex64(bss_end, session->caps);
-        sys_uart_write("\nStack start : ", KSTRLEN("\nStack start : "), session->caps);
+        sys_uart_write("\r\nStack start : ", KSTRLEN("\r\nStack start : "), session->caps);
         sys_uart_hex64(stack_start, session->caps);
-        sys_uart_write("\nStack end   : ", KSTRLEN("\nStack end   : "), session->caps);
+        sys_uart_write("\r\nStack end   : ", KSTRLEN("\r\nStack end   : "), session->caps);
         sys_uart_hex64(stack_end, session->caps);
-        sys_uart_write("\n", 1, session->caps);
+        sys_uart_write("\r\n", 2, session->caps);
     } else {
-        sys_uart_write("Memory info not allowed\n", KSTRLEN("Memory info not allowed\n"), session->caps);
+        sys_uart_write("Memory info not allowed\r\n", KSTRLEN("Memory info not allowed\r\n"), session->caps);
     }
 }
 
-/* Echo command: prints arguments back safely */
+/* Echo command */
 static void cmd_echo(const char *args, ai_session_t *session)
 {
     if (!args) return;
     size_t len = k_strlen(args);
     if (len > CMD_BUF_SIZE - 1) len = CMD_BUF_SIZE - 1;
     sys_uart_write(args, len, session->caps);
-    sys_uart_write("\n", 1, session->caps);
+    sys_uart_write("\r\n", 2, session->caps);
 }
 
-/* Sandbox command: parse, verify, and execute a sandboxed tool call */
+/* Run verified sandbox tool */
 static void cmd_sandbox(const char *args, ai_session_t *session)
 {
     if (!args || args[0] == '\0') {
-        sys_uart_write("usage: sandbox <command> [args]\n",
-                       KSTRLEN("usage: sandbox <command> [args]\n"),
-                       session->caps);
+        sys_uart_write("usage: sandbox <command> [args]\r\n", KSTRLEN("usage: sandbox <command> [args]\r\n"), session->caps);
         return;
     }
-
     sandbox_execute(&sb_ctx, args);
 }
 
+/* Run multi-step AIQL pipeline */
 static void cmd_pipeline(const char *args, ai_session_t *session)
 {
     if (!args || args[0] == '\0') {
-        sys_uart_write("usage: pipeline <step1>; <step2>; ...\n",
-                       KSTRLEN("usage: pipeline <step1>; <step2>; ...\n"),
-                       session->caps);
-        sys_uart_write("  e.g: pipeline el -> level; echo done\n",
-                       KSTRLEN("  e.g: pipeline el -> level; echo done\n"),
-                       session->caps);
+        sys_uart_write("usage: pipeline <step1>; <step2>; ...\r\n", KSTRLEN("usage: pipeline <step1>; <step2>; ...\r\n"), session->caps);
         return;
     }
-
     sandbox_run_pipeline(&sb_ctx, args);
 }
 
-/* Print help for all commands (ASCII dash to avoid UTF-8 mismatch) */
+/* Master IRQ Enable */
+static void cmd_irq(const char *args, ai_session_t *session)
+{
+    (void)args;
+    irq_enable_in_cpu();
+    sys_uart_write("IRQ dispatch enabled. PSTATE.I unmasked.\r\n", KSTRLEN("IRQ dispatch enabled. PSTATE.I unmasked.\r\n"), session->caps);
+}
+
+/* Bind an AI reflex to hardware */
+static void cmd_irq_bind(const char *args, ai_session_t *session)
+{
+    if (!args || args[0] == '\0') {
+        sys_uart_write("usage: irq_bind <num> <pipeline>\r\n", KSTRLEN("usage: irq_bind <num> <pipeline>\r\n"), session->caps);
+        return;
+    }
+
+    uint32_t irq_num = 0;
+    const char *p = args;
+    while (*p >= '0' && *p <= '9') {
+        irq_num = irq_num * 10 + (*p - '0');
+        p++;
+    }
+    while (*p == ' ') p++;
+
+    static pipeline_t reflex_pipe; 
+    if (interpreter_parse_pipeline(p, &reflex_pipe)) {
+        if (irq_register_pipeline(irq_num, &reflex_pipe, &sb_ctx)) {
+            irq_enable(irq_num);
+            sys_uart_write("IRQ bound and enabled.\r\n", KSTRLEN("IRQ bound and enabled.\r\n"), session->caps);
+        }
+    } else {
+        sys_uart_write("Error parsing pipeline.\r\n", KSTRLEN("Error parsing pipeline.\r\n"), session->caps);
+    }
+}
+
+/* Help list */
 static void cmd_help(const char *args, ai_session_t *session)
 {
     (void)args;
-    sys_uart_write("Available commands:\n", KSTRLEN("Available commands:\n"), session->caps);
+    sys_uart_write("Available commands:\r\n", KSTRLEN("Available commands:\r\n"), session->caps);
     for (size_t i = 0; i < NUM_COMMANDS; i++) {
         sys_uart_write("  ", 2, session->caps);
         sys_uart_write(commands[i].name, k_strlen(commands[i].name), session->caps);
         sys_uart_write("\t- ", KSTRLEN("\t- "), session->caps);
         sys_uart_write(commands[i].help, k_strlen(commands[i].help), session->caps);
-        sys_uart_write("\n", 1, session->caps);
+        sys_uart_write("\r\n", 2, session->caps);
     }
 }
 
 /* ---- Command dispatcher ---------------------------------------------- */
-/* Splits input into command and optional arguments, passing session */
 static void execute_command(const char *input, ai_session_t *session)
 {
-    sys_uart_write("\n", 1, session->caps);
-
-    if (input[0] == '\0') {
-        sys_uart_write(PROMPT, KSTRLEN(PROMPT), session->caps);
-        return;
-    }
+    sys_uart_write("\r\n", 2, session->caps);
+    if (input[0] == '\0') return;
 
     for (size_t i = 0; i < NUM_COMMANDS; i++) {
         size_t name_len = k_strlen(commands[i].name);
-
-        /* Command matches exactly or is followed by a space (argument) */
         if ((k_strncmp(input, commands[i].name, name_len) == 0) &&
             (input[name_len] == '\0' || input[name_len] == ' ')) {
-
             const char *args = input + name_len;
-            if (*args == ' ') args++;
-
+            while (*args == ' ') args++;
             commands[i].handler(args, session);
-            sys_uart_write(PROMPT, KSTRLEN(PROMPT), session->caps);
             return;
         }
     }
-
-    sys_uart_write("Unknown command: '", KSTRLEN("Unknown command: '"), session->caps);
-    sys_uart_write(input, k_strlen(input), session->caps);
-    sys_uart_write("'  (type 'help' for a list)\n", KSTRLEN("'  (type 'help' for a list)\n"), session->caps);
-    sys_uart_write(PROMPT, KSTRLEN(PROMPT), session->caps);
+    sys_uart_write("Unknown command.\r\n", KSTRLEN("Unknown command.\r\n"), session->caps);
 }
 
 /* ---- Entry point ----------------------------------------------------- */
 void kernel_main(void)
 {
-    /* ---- Initialize UART for console I/O ---- */
+    /* 1. UART Init */
     uart_init();
+    uart_puts("[boot] uart ok\r\n");
 
-    /* ---- Create an AI session ---- */
-    ai_session_t session = {
-        .caps = CAP_MMIO | CAP_READ_MEM,
-    };
+    /* 2. MMU Init */
+    mmu_init();
+    mmu_enable();
+    uart_puts("[boot] mmu ok\r\n");
 
-    /* ---- Create an intent object for this session ---- */
+    /* 3. Exception Vectors (VBAR) */
+    /* Sync with mmu.S: Using vbar_install to load kai_vector_table */
+    vbar_install(); 
+    uart_puts("[boot] vbar ok\r\n");
+
+    /* 4. GIC Init */
+    irq_init();
+    uart_puts("[boot] gic ok\r\n");
+
+    /* 5. AI Session & Sandbox Preparation 
+     * NOTE: If the kernel hangs here, the MMU mapping for the 
+     * sandbox scratchpad (0x40400000) is likely missing.
+     */
+    uart_puts("[boot] entering sandbox_init...\r\n");
+    ai_session_t session = { .caps = CAP_MMIO | CAP_READ_MEM | CAP_UART_WRITE };
     intent_object_t intent = {
         .caps = session.caps,
-        .instruction_budget = 1000,  /* Max instructions/pipeline steps */
-        .pipeline = NULL              /* No preloaded pipeline yet */
+        .instruction_budget = 1000,
+        .pipeline = NULL
     };
-
-    /* ---- Initialize the sandbox with the intent ---- */
     sandbox_init(&sb_ctx, &intent);
+    uart_puts("[boot] sandbox ok\r\n");
 
-    /* ---- Display welcome banner ---- */
-    sys_uart_puts("========================\n", session.caps);
-    sys_uart_puts("      Kernel AI OS      \n", session.caps);
-    sys_uart_puts("========================\n", session.caps);
+    /* 6. Welcome Banner */
+    uart_puts("\r\n========================\r\n");
+    uart_puts("      Kernel AI OS      \r\n");
+    uart_puts("========================\r\n");
 
-    sys_uart_puts("EL: ", session.caps);
+    uart_puts("EL: ");
     char el_char = '0' + (char)current_el();
-    sys_uart_puts(&el_char, session.caps);
-    sys_uart_puts("   |   Type 'help' for commands\n", session.caps);
+    uart_putc(el_char);
+    uart_puts("   |   Ready\r\n\r\n");
 
-    sys_uart_write(PROMPT, KSTRLEN(PROMPT), session.caps);
+    uart_puts(PROMPT);
 
-    /* ---- Main input buffer ---- */
+    /* 7. Main Shell Loop */
     char buf[CMD_BUF_SIZE];
     size_t index = 0U;
 
     while (true) {
-        char c = uart_getc();  /* blocking read from UART */
+        char c = uart_getc();
 
-        /* ---- Enter key: execute command ---- */
+        /* Handle Enter/Newline */
         if (c == '\r' || c == '\n') {
             buf[index] = '\0';
-
-            /* Only execute if input is non-empty */
             if (index > 0U) {
                 execute_command(buf, &session);
                 index = 0U;
             }
-
-            /* Reset prompt */
-            sys_uart_write(PROMPT, KSTRLEN(PROMPT), session.caps);
+            uart_puts("\r\n");
+            uart_puts(PROMPT);
         }
-
-        /* ---- Backspace handling ---- */
+        /* Handle Backspace (\x7F or \x08) */
         else if ((c == '\x7F') || (c == '\x08')) {
             if (index > 0U) {
                 index--;
-                sys_uart_write("\b \b", KSTRLEN("\b \b"), session.caps);
+                uart_puts("\b \b");
             }
         }
-
-        /* ---- Printable characters ---- */
+        /* Handle Printable Characters */
         else if (is_printable(c) && index < (CMD_BUF_SIZE - 1U)) {
             buf[index++] = c;
-            sys_uart_write(&c, 1, session.caps);
-        }
-
-        /* ---- Safety: prevent buffer overflow ---- */
-        else if (index >= (CMD_BUF_SIZE - 1U)) {
-            sys_uart_write("\n[ERROR] input too long\n", KSTRLEN("\n[ERROR] input too long\n"), session.caps);
-            index = 0U;
-            sys_uart_write(PROMPT, KSTRLEN(PROMPT), session.caps);
+            uart_putc(c);
         }
     }
 }

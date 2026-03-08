@@ -32,6 +32,11 @@ _start:
     ldr     x0, =__stack_top
     mov     sp, x0
 
+    /* Enable FP/SIMD at EL1+EL0 — compiler may emit SIMD instructions */
+    mov     x0, #(3 << 20)
+    msr     cpacr_el1, x0
+    isb
+
     /* ------------------------------------------------------------------ *
      * Zero BSS using start/end pointer comparison.                       *
      * This avoids the word-count drift bug present in size-based loops.  *

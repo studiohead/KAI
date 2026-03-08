@@ -3,27 +3,17 @@
  *
  * Target: QEMU -M virt
  * Load address: 0x40000000  (default QEMU virt kernel load point)
- *
- * Memory layout (low → high):
- *
- *   0x40000000  .text       — code (boot entry first)
- *               .rodata     — read-only data
- *               .data       — initialised data
- *               .bss        — zero-initialised data
- *               [4 KB guard page — catches stack overflow before it hits BSS]
- *               [64 KB stack region, grows downward]
- *   __stack_top              — sp initialised here by boot.S
  */
 
 ENTRY(_start)
 
 SECTIONS
 {
+    /* The kernel starts at 1GB in the physical address space */
     . = 0x40000000;
 
     /* ------------------------------------------------------------------ *
-     * .text — executable code.  Boot stub must come first so that the    *
-     * image entry point is exactly at the load address.                  *
+     * .text — executable code.  Boot stub first.                         *
      * ------------------------------------------------------------------ */
     .text : {
         KEEP(*(.text.boot))
@@ -31,7 +21,7 @@ SECTIONS
     }
 
     /* ------------------------------------------------------------------ *
-     * .rodata — constants, string literals, jump tables.                 *
+     * .rodata — constants and string literals.                            *
      * ------------------------------------------------------------------ */
     .rodata : {
         . = ALIGN(16);
@@ -48,10 +38,6 @@ SECTIONS
 
     /* ------------------------------------------------------------------ *
      * .bss — zero-initialised globals.                                   *
-     *                                                                    *
-     * PROVIDE() prevents a linker error when the section is empty.       *
-     * boot.S zeroes the region [__bss_start, __bss_end) using 8-byte    *
-     * stores, so both symbols must be 8-byte aligned.                    *
      * ------------------------------------------------------------------ */
     .bss (NOLOAD) : {
         . = ALIGN(16);
@@ -63,26 +49,70 @@ SECTIONS
     }
 
     /* ------------------------------------------------------------------ *
-     * Guard page — 4 KB of address space intentionally left unmapped.    *
-     * A stack overflow will fault here rather than silently trashing BSS.*
+     * Kernel stack + guard pages.                                        *
      * ------------------------------------------------------------------ */
     . = ALIGN(4096);
     PROVIDE(__guard_bottom = .);
-    . = . + 0x1000;         /* 4 KB */
+    . = . + 0x1000;
     PROVIDE(__guard_top = .);
 
-    /* ------------------------------------------------------------------ *
-     * Stack — 64 KB, growing downward from __stack_top.                 *
-     * ------------------------------------------------------------------ */
     . = ALIGN(16);
     PROVIDE(__stack_bottom = .);
-    . = . + 0x10000;        /* 64 KB */
+    . = . + 0x10000;
     PROVIDE(__stack_top = .);
 
     /* ------------------------------------------------------------------ *
-     * Discard unwanted sections that toolchains sometimes emit.          *
-     * Keeps the final binary clean and avoids RWX segment warnings.      *
+     * EL0 sandbox stack.                                                 *
      * ------------------------------------------------------------------ */
+    . = ALIGN(4096);
+    PROVIDE(__el0_guard_bottom = .);
+    . = . + 0x1000;
+    
+    . = ALIGN(4096);
+    PROVIDE(__el0_stack_bottom = .);
+    . = . + 0x4000;
+    PROVIDE(__el0_stack_top = .);
+
+    . = ALIGN(4096);
+    PROVIDE(__el0_stack_guard = .);
+    . = . + 0x1000;
+
+    /* ------------------------------------------------------------------ *
+     * .page_tables — MMU translation tables.                             *
+     * * * Base must be 4KB aligned for TTBR0_EL1 to accept the pointer.
+     * ------------------------------------------------------------------ */
+    . = ALIGN(4096);
+    .page_tables (NOLOAD) : {
+        PROVIDE(__page_tables_start = .);
+        . = . + 0x3000;
+        PROVIDE(__page_tables_end = .);
+    }
+
+    /* * MARKER: The kernel "private" area ends here. 
+     * This allows mmu.c to map everything before this as EL1-only.
+     */
+    . = ALIGN(16);
+    PROVIDE(__kernel_end = .);
+
+    /* ------------------------------------------------------------------ *
+     * .sandbox_scratch — THE SECURITY BOUNDARY                           *
+     * *
+     * We ALIGN(0x200000) (2 MB) so that this section starts at the       *
+     * beginning of a new L2 Block Descriptor. This ensures that the      *
+     * ATTR_EL0_DATA attributes applied in mmu.c do not accidentally      *
+     * cover kernel code, stacks, or private data.                       *
+     * ------------------------------------------------------------------ */
+    . = ALIGN(0x200000); 
+    .sandbox_scratch (NOLOAD) : {
+        PROVIDE(__sandbox_scratch_start = .);
+        /* We reserve exactly 2MB to fill the hardware block descriptor */
+        . = . + 0x200000;
+        PROVIDE(__sandbox_scratch_end = .);
+    }
+
+    /* Final alignment padding to keep the image clean */
+    . = ALIGN(0x200000);
+
     /DISCARD/ : {
         *(.comment)
         *(.gnu.attributes)

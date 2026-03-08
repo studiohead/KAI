@@ -1,0 +1,12 @@
+# tools/examples/timed_sequence.kai
+#
+# Timed motor sequence: forward → pause → turn → pause → forward.
+# Demonstrates OP_SLEEP for robot timing coordination.
+
+echo starting timed sequence
+write 0 0x01        # forward
+sleep 1000          # hold for 1 second
+write 0 0x03        # turn right
+sleep 500           # hold for 500ms
+write 0 0x01        # forward again
+echo sequence complete
