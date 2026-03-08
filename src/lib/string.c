@@ -61,3 +61,15 @@ void *k_memset(void *dst, int c, size_t n)
         *p++ = (unsigned char)c;
     return dst;
 }
+
+/* ======================================================================
+ * k_strcpy — copy src to dst including terminating NUL.
+ * Assumes dst is large enough (we always use CMD_BUF_SIZE).
+ * ====================================================================== */
+char *k_strcpy(char *dst, const char *src)
+{
+    char *d = dst;
+    while ((*d++ = *src++) != '\0')
+        ;
+    return dst;
+}

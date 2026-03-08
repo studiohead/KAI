@@ -23,6 +23,13 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <stdbool.h>
+#define COL_RESET   "\033[0m"
+#define COL_BOLD    "\033[1m"
+#define COL_GREEN   "\033[32m"
+#define COL_CYAN    "\033[36m"
+#define COL_YELLOW  "\033[33m"
+#define COL_RED     "\033[31m"
+#define COL_BLUE    "\033[34m"
 
 
 /* External assembly function from src/arch/aarch64/mmu.S */
@@ -33,7 +40,14 @@ extern void vbar_install(void);
 
 /* ---- Configuration --------------------------------------------------- */
 #define CMD_BUF_SIZE    128U    /* Max bytes per command line (incl. NUL) */
-#define PROMPT          "m4-kernel# "
+#define PROMPT      COL_BOLD COL_GREEN "kai" COL_RESET COL_CYAN "# " COL_RESET
+
+/* Command history */
+#define HISTORY_SIZE 8
+static char history[HISTORY_SIZE][CMD_BUF_SIZE];
+static uint8_t hist_idx = 0;
+static uint8_t hist_count = 0;
+static int hist_view = -1;   /* -1 = currently typing */
 
 /* ---- AI Session Struct ----------------------------------------------- */
 typedef struct {
@@ -277,9 +291,9 @@ void kernel_main(void)
     sandbox_init(&sb_ctx, &intent);
 
     /* 6. Welcome Banner */
-    uart_puts("\r\n========================\r\n");
-    uart_puts("      Kernel AI OS      \r\n");
-    uart_puts("========================\r\n");
+    uart_puts(COL_BOLD COL_CYAN "========================\r\n");
+    uart_puts("      K A I   O S      \r\n");
+    uart_puts("========================\r\n" COL_RESET);
 
     uart_puts("EL: ");
     char el_char = '0' + (char)current_el();
@@ -288,31 +302,68 @@ void kernel_main(void)
 
     uart_puts(PROMPT);
 
-    /* 7. Main Shell Loop */
+        /* 7. Main Shell Loop — now with real history + Up/Down arrows */
     char buf[CMD_BUF_SIZE];
     size_t index = 0U;
 
     while (true) {
         char c = uart_getc();
 
-        /* Handle Enter/Newline */
         if (c == '\r' || c == '\n') {
             buf[index] = '\0';
             if (index > 0U) {
+                /* Save to history */
+                k_strcpy(history[hist_idx], buf);
+                hist_idx = (hist_idx + 1) % HISTORY_SIZE;
+                if (hist_count < HISTORY_SIZE) hist_count++;
+
                 execute_command(buf, &session);
                 index = 0U;
+                hist_view = -1;
             }
             uart_puts("\r\n");
             uart_puts(PROMPT);
         }
-        /* Handle Backspace (\x7F or \x08) */
-        else if ((c == '\x7F') || (c == '\x08')) {
+        else if ((c == '\x7F') || (c == '\x08')) {  /* backspace */
             if (index > 0U) {
                 index--;
                 uart_puts("\b \b");
             }
         }
-        /* Handle Printable Characters */
+        else if (c == '\x1B') {  /* ESC sequence (arrows) */
+            uart_getc(); /* skip '[' */
+            char dir = uart_getc();
+
+            if (dir == 'A' && hist_count > 0) {  /* UP */
+                if (hist_view < 0) hist_view = (int)hist_idx - 1;
+                else hist_view = (hist_view - 1 + HISTORY_SIZE) % HISTORY_SIZE;
+
+                k_strcpy(buf, history[hist_view]);
+                index = k_strlen(buf);
+
+                /* Redraw cleanly with ANSI (this is what fixes the backspace bug) */
+                uart_puts("\r" PROMPT);
+                uart_puts(buf);
+                uart_puts("\033[K");  /* clear to end of line */
+            }
+            else if (dir == 'B' && hist_count > 0) {  /* DOWN */
+                if (hist_view >= 0) {
+                    hist_view = (hist_view + 1) % HISTORY_SIZE;
+                    if (hist_view == (int)hist_idx) {
+                        hist_view = -1;
+                        buf[0] = '\0';
+                        index = 0U;
+                    } else {
+                        k_strcpy(buf, history[hist_view]);
+                        index = k_strlen(buf);
+                    }
+
+                    uart_puts("\r" PROMPT);
+                    uart_puts(buf);
+                    uart_puts("\033[K");
+                }
+            }
+        }
         else if (is_printable(c) && index < (CMD_BUF_SIZE - 1U)) {
             buf[index++] = c;
             uart_putc(c);
