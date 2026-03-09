@@ -24,6 +24,7 @@
 #include <kernel/string.h>
 #include <kernel/syscall.h>
 #include <kernel/uart.h>
+#include <kernel/aiql.h>
 #include <stdint.h>
 #include <stddef.h>
 #include <stdbool.h>
@@ -103,6 +104,7 @@ static void cmd_pipeline(const char *args, ai_session_t *session);
 static void cmd_dag(const char *args, ai_session_t *session);
 static void cmd_irq(const char *args, ai_session_t *session);
 static void cmd_irq_bind(const char *args, ai_session_t *session);
+static void cmd_aiql(const char *args, ai_session_t *session);
 
 /* ---- Command table --------------------------------------------------- */
 static const command_t commands[] = {
@@ -117,6 +119,7 @@ static const command_t commands[] = {
     { "dag",      "Build DAG from pipeline and show schedule", cmd_dag     },
     { "irq_init", "Enable CPU IRQ delivery (start reflexes)", cmd_irq      },
     { "irq_bind", "Bind IRQ <num> to <pipeline>",            cmd_irq_bind },
+    { "aiql",     "Execute an AIQL JSON program directly",     cmd_aiql     },
 };
 
 #define NUM_COMMANDS  (sizeof(commands) / sizeof(commands[0]))
@@ -297,6 +300,81 @@ static void cmd_dag(const char *args, ai_session_t *session)
     kai_dag_destroy(&dag);
 }
 
+
+/* ---- AIQL command --------------------------------------------------------
+ * Accepts JSON inline on the command line, OR reads a large JSON payload
+ * from UART when the args start with '{' but the shell buf was truncated.
+ *
+ * Two modes:
+ *   aiql {"type":"Program",...}   -- JSON passed as arg (agent sends this)
+ *   aiql                          -- prompt for multi-line JSON (interactive)
+ *
+ * The static json_buf lives here so it doesn't blow the stack.
+ */
+static char aiql_json_buf[AIQL_BUF_SIZE];
+
+static void cmd_aiql(const char *args, ai_session_t *session)
+{
+    size_t len = 0;
+
+    if (args && args[0] == '{') {
+        /* ---- Inline mode: JSON was passed directly as the arg ----------- */
+        len = k_strlen(args);
+        if (len >= AIQL_BUF_SIZE) {
+            uart_puts("[aiql] error: JSON too large (max ");
+            /* print AIQL_BUF_SIZE-1 as decimal */
+            char tmp[8]; uint32_t v=AIQL_BUF_SIZE-1, i=7; tmp[i]='\0';
+            while (v && i>0) { tmp[--i]=(char)('0'+(int)(v%10)); v/=10; }
+            uart_puts(tmp+i);
+            uart_puts(" bytes)\r\n");
+            return;
+        }
+        k_memset(aiql_json_buf, 0, sizeof(aiql_json_buf));
+        for (size_t j=0; j<len; j++) aiql_json_buf[j] = args[j];
+        aiql_json_buf[len] = '\0';
+    } else {
+        /* ---- Interactive mode: read JSON from UART until balanced '}' -- */
+        uart_puts("[aiql] paste JSON then press Enter:\r\n");
+        k_memset(aiql_json_buf, 0, sizeof(aiql_json_buf));
+        len = 0;
+        int depth = 0; bool started = false;
+
+        while (len < AIQL_BUF_SIZE - 1U) {
+            char c = uart_getc();
+            if (c == '\r' || c == '\n') {
+                if (started && depth == 0) break;   /* done */
+                aiql_json_buf[len++] = ' ';           /* normalise newlines */
+                continue;
+            }
+            if (c == '{') { depth++; started = true; }
+            else if (c == '}') depth--;
+            aiql_json_buf[len++] = c;
+            uart_putc(c);                           /* echo back */
+            if (started && depth == 0) break;       /* balanced */
+        }
+        aiql_json_buf[len] = '\0';
+        uart_puts("\r\n");
+
+        if (!started || len == 0) {
+            uart_puts("[aiql] error: no JSON received\r\n");
+            return;
+        }
+    }
+
+    /* ---- Extract -------------------------------------------------------- */
+    aiql_program_t prog;
+    aiql_err_t err = aiql_extract(aiql_json_buf, len, &prog);
+    if (err != AIQL_OK) {
+        uart_puts("[aiql] extract error: ");
+        uart_puts(aiql_err_str(err));
+        uart_puts("\r\n");
+        return;
+    }
+
+    /* ---- Execute -------------------------------------------------------- */
+    aiql_execute_program(&prog, &sb_ctx, session->caps);
+}
+
 /* Help list */
 static void cmd_help(const char *args, ai_session_t *session)
 {
@@ -437,9 +515,71 @@ void kernel_main(void)
                 }
             }
         }
-        else if (is_printable(c) && index < (CMD_BUF_SIZE - 1U)) {
-            buf[index++] = c;
-            uart_putc(c);
+        else if (is_printable(c)) {
+            if (index < (CMD_BUF_SIZE - 1U)) {
+                buf[index++] = c;
+                uart_putc(c);
+            } else if (index == (CMD_BUF_SIZE - 1U)) {
+                /* Buffer full: if this is an aiql command, switch to the
+                 * wide JSON buffer and keep reading until braces balance. */
+                buf[index] = '\0';
+                if (k_strncmp(buf, "aiql ", 5) == 0) {
+                    /* Copy what we have so far into the JSON buf */
+                    size_t json_start = 5; /* skip "aiql " */
+                    size_t ji = 0;
+                    int depth = 0; bool started = false;
+                    /* Seed from existing buf */
+                    for (size_t si = json_start;
+                         si < CMD_BUF_SIZE - 1U && ji < AIQL_BUF_SIZE - 1U;
+                         si++) {
+                        char bc = buf[si];
+                        if (bc == '{') { depth++; started = true; }
+                        else if (bc == '}') depth--;
+                        aiql_json_buf[ji++] = bc;
+                    }
+                    /* Now keep reading from UART */
+                    uart_putc(c); /* echo the char that triggered overflow */
+                    if (c == '{') { depth++; started = true; }
+                    else if (c == '}') depth--;
+                    if (ji < AIQL_BUF_SIZE - 1U) aiql_json_buf[ji++] = c;
+
+                    while (ji < AIQL_BUF_SIZE - 1U) {
+                        char jc = uart_getc();
+                        if (jc == '\r' || jc == '\n') {
+                            if (started && depth == 0) break;
+                            aiql_json_buf[ji++] = ' ';
+                            continue;
+                        }
+                        if (jc == '\x7F' || jc == '\x08') {
+                            if (ji > 0) { ji--; uart_puts("\b \b"); }
+                            continue;
+                        }
+                        if (jc == '{') { depth++; started = true; }
+                        else if (jc == '}') depth--;
+                        aiql_json_buf[ji++] = jc;
+                        uart_putc(jc);
+                        if (started && depth == 0) break;
+                    }
+                    aiql_json_buf[ji] = '\0';
+                    uart_puts("\r\n");
+
+                    /* Execute directly — bypass normal dispatch */
+                    if (started && ji > 0) {
+                        aiql_program_t prog;
+                        aiql_err_t err = aiql_extract(aiql_json_buf, ji, &prog);
+                        if (err != AIQL_OK) {
+                            uart_puts("[aiql] extract error: ");
+                            uart_puts(aiql_err_str(err));
+                            uart_puts("\r\n");
+                        } else {
+                            aiql_execute_program(&prog, &sb_ctx, session.caps);
+                        }
+                    }
+                    index = 0U;
+                    uart_puts(PROMPT);
+                }
+                /* else: non-aiql command, just drop the char silently */
+            }
         }
     }
 }

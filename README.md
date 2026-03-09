@@ -90,6 +90,8 @@ kai_os/
 │   ├── syscall.c           # sys_uart_write, sys_uart_hex64
 │   └── uart.c              # PL011 UART driver
 ├── tools/
+│   ├── api_to_kai.py       # AIQL AST to KAI pipeline compiler
+│   ├── kai_agent.py        # KAI/LLM agent bridge (AIQL-native)
 │   ├── kai_compiler.py     # Host-side .kai script compiler
 │   └── examples/
 │       ├── obstacle_avoid.kai

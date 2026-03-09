@@ -65,6 +65,7 @@ C_SRCS   := \
     $(SRC_DIR)/kai_interner.c            \
     $(SRC_DIR)/kai_dag.c                 \
     $(SRC_DIR)/kai_scheduler.c           \
+    $(SRC_DIR)/aiql.c           \
     $(SRC_DIR)/sandbox/sandbox.c         \
     $(SRC_DIR)/sandbox/interpreter.c     \
     $(SRC_DIR)/sandbox/verifier.c        \

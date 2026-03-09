@@ -73,3 +73,20 @@ char *k_strcpy(char *dst, const char *src)
         ;
     return dst;
 }
+
+/* ======================================================================
+ * k_memcpy — copy n bytes from src to dst.
+ * Basic implementation for bare-metal AArch64.
+ * ====================================================================== */
+void *k_memcpy(void *dst, const void *src, size_t n) {
+    unsigned char *d = (unsigned char *)dst;
+    const unsigned char *s = (const unsigned char *)src;
+    for (size_t i = 0; i < n; i++) {
+        d[i] = s[i];
+    }
+    return dst;
+}
+
+/* Standard library aliases for the compiler */
+void *memcpy(void *dest, const void *src, size_t n) __attribute__((alias("k_memcpy")));
+void *memset(void *s, int c, size_t n) __attribute__((alias("k_memset")));
