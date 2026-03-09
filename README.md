@@ -21,6 +21,7 @@ KAI is a formally verified, capability-gated, pipeline-based command language th
 - [Interrupt-Driven Pipelines (Reflexes)](#interrupt-driven-pipelines-reflexes)
 - [KAI Script Compiler](#kai-script-compiler)
 - [AIQL Integration](#aiql-integration)
+- [KAI Kernel IR](#kai-kernel-ir)
 - [KAI as the Robot Brain](#kai-as-the-robot-brain)
 - [Author](#author)
 - [License](#license)
@@ -45,6 +46,7 @@ KAI is a formally verified, capability-gated, pipeline-based command language th
 - **AIQL (https://github.com/studiohead/AIQL) pipeline engine** — multi-step pipeline execution derived from the AIQL AST schema
 - **New opcodes**: `sleep` (timer-based delay), `introspect` (MMIO map query), `wait_event` (WFE yield stub)
 - **KAI Script Compiler** — host-side Python tool compiles `.kai` scripts to pipeline strings
+- **KAI Kernel IR** — a true DAG runtime above the sandbox: `kai_node` (computation atom with structural hash), `kai_interner` (canonical node factory with deduplication), `kai_dag` (graph container with cycle detection), `kai_scheduler` (topological sort into parallel execution stages with AIQL cost-driven ordering)
 
 ---
 
@@ -55,6 +57,10 @@ kai_os/
 ├── include/
 │   └── kernel/
 │       ├── irq.h           # GIC-400 driver and IRQ-to-pipeline binding API
+│       ├── kai_dag.h       # KAI IR: graph container, cycle detection
+│       ├── kai_interner.h  # KAI IR: canonical node factory and deduplication
+│       ├── kai_node.h      # KAI IR: computation atom (opcode, hash, deps, cost)
+│       ├── kai_scheduler.h # KAI IR: topological sort into parallel execution stages
 │       ├── memory.h        # Memory region whitelist and sys_mem_* declarations
 │       ├── mmio.h          # Typed MMIO read/write helpers
 │       ├── mmu.h           # MMU page table types, constants, public API
@@ -73,6 +79,10 @@ kai_os/
 │   │   ├── interpreter.c   # Tool call + pipeline parser, variable store, opcode dispatcher
 │   │   ├── sandbox.c       # Sandbox init, single-shot execute, pipeline run, result strings
 │   │   └── verifier.c      # Pre-execution AST and pipeline validation
+│   ├── kai_dag.c           # Graph container: add/remove nodes, build from pipeline, cycle DFS
+│   ├── kai_interner.c      # Node interning: FNV-1a hash table, pool allocator, retain/release
+│   ├── kai_node.c          # Structural hash (FNV-1a) and deep equality for node identity
+│   ├── kai_scheduler.c     # Level-based topo sort, stage generation, cheap-first cost sort
 │   ├── kernel.c            # kernel_main, AI session, command shell
 │   ├── irq.c               # GIC-400 driver, IRQ-to-pipeline dispatch table
 │   ├── memory.c            # Memory regions, sys_mem_info, sys_mem_read
@@ -127,6 +137,7 @@ make clean        # remove build/
 | `echo <text>` | Echo text back to the terminal |
 | `sandbox <call>` | Parse, verify, and execute a single sandboxed tool call |
 | `pipeline <steps>` | Parse, verify, and execute a multi-step AIQL pipeline |
+| `dag <steps>` | Build a DAG from a pipeline, run the scheduler, and print the execution plan |
 | `irq_init` | Enable CPU-level IRQ delivery (activate hardware reflexes) |
 | `irq_bind <num> <pipeline>` | Bind a pipeline to a hardware interrupt number |
 
@@ -358,6 +369,129 @@ echo done
 ```
 
 The compiler handles flattening of `if/then/else` blocks into the wire format (`then:N else:M` step offsets), rejoining `echo` arguments, and validating against known limits before output.
+
+---
+
+## KAI Kernel IR
+
+The KAI Kernel IR is a DAG-based computation layer that sits above the sandbox's linear pipeline model. It transforms pipeline strings into a true directed acyclic graph, deduplicates nodes, detects cycles, and produces an optimised execution plan before any instruction runs.
+
+### The Four Layers
+
+```
+AIQL AST (JSON program)
+       ↓
+kai_dag_build_from_pipeline()
+       ↓
+kai_interner_get_or_create()   ← deduplication here
+       ↓
+canonical kai_dag_t
+       ↓
+kai_dag_has_cycle()            ← safety gate
+       ↓
+kai_scheduler_build()
+       ↓
+kai_schedule_t (stages)        ← parallel groups, cost-sorted
+       ↓
+sandbox interpreter (exec)
+```
+
+### `kai_node` — The Computation Atom
+
+Each node is an immutable, hash-identified unit of computation. Once interned, its fields are frozen and it can be safely shared across multiple DAGs.
+
+```c
+typedef struct kai_node {
+    sandbox_opcode_t  opcode;
+    uint32_t          hash;           // FNV-1a structural identity
+    uint32_t          ref_count;      // shared ownership tracking
+    uint32_t          flags;          // IMMUTABLE | VALIDATED | SCHEDULED
+    uint32_t          cost_estimate;  // scheduler hint: higher = more expensive
+    uint32_t          caps_required;
+    uint32_t          dep_count;
+    struct kai_node  *deps[8];        // dependency edges
+    uint32_t          argc;
+    char              args[4][32];
+} kai_node_t;
+```
+
+The hash is computed with FNV-1a over opcode + args + dependency hashes. Mixing dep hashes makes identity tree-sensitive: two nodes with the same opcode but different dependency chains get distinct hashes.
+
+### `kai_interner` — Canonical Node Factory
+
+The interner is what makes this a DAG instead of a tree. Two pipeline steps with identical opcode and args collapse into one shared pointer. Common-subexpression elimination falls out automatically.
+
+```c
+// Returns an existing node if structurally identical, or allocates a new one
+kai_node_t *kai_interner_get_or_create(intern, opcode, caps, argc, args, deps, dep_count, cost);
+
+// Shared ownership
+void kai_node_retain(kai_node_t *node);
+void kai_node_release(kai_node_t *node);
+```
+
+The interner owns all node memory via a static pool (no malloc on bare metal). An open-addressed hash table (linear probing) provides O(1) amortised lookup.
+
+### `kai_dag` — The Graph Container
+
+Holds node references and exposes graph-level operations. Does not own node memory — the interner does.
+
+```c
+kai_dag_init(&dag);
+kai_dag_build_from_pipeline(&dag, &intern, &pipeline);
+kai_dag_has_cycle(&dag);    // iterative DFS, no recursion
+kai_dag_destroy(&dag);
+```
+
+### `kai_scheduler` — Execution Planner
+
+Level-based topological sort groups independent nodes into parallel stages. Within each stage, nodes are sorted by `cost_estimate` ascending (cheap-first).
+
+```c
+kai_schedule_t schedule;
+kai_scheduler_build(&dag, &schedule);
+kai_scheduler_print(&schedule, caps);
+```
+
+**Cost hierarchy** (derived from AIQL call types):
+
+| Node type | Cost | Rationale |
+|---|---|---|
+| `OP_EL`, `OP_CAPS`, `OP_NOP` | 1 | Near-zero, control only |
+| `OP_ECHO`, `OP_INTROSPECT` | 1 | UART output |
+| `OP_READ`, `OP_WRITE`, `OP_INFO` | 10 | Memory operations |
+| `OP_SLEEP` | 50 | Variable timing |
+| future: `classifier` call | 100 | GPU-bound inference |
+| future: `llm` call | 1000 | Network/LLM, most expensive |
+
+This matches the AIQL cost model exactly: `FeatureEngineering` (cheap) runs before `classifier` (medium) which runs before `llm` (expensive) — the scheduler enforces this automatically from the graph structure.
+
+### `dag` Shell Command
+
+```
+dag <step1>; <step2>; ...
+```
+
+Parses the pipeline, builds the DAG through the interner, runs cycle detection, generates the execution schedule, and prints the full stage breakdown plus interner pool stats.
+
+```
+kai# dag echo hello; caps; el; info
+[dag] nodes: 0x0000000000000004
+schedule: 0x0000000000000004 stages, 0x0000000000000004 nodes
+  stage 0 [cost=1] 1 node(s):
+    op=4 cost=1 hash=0x... deps=0
+  stage 1 [cost=1] 1 node(s):
+    op=6 cost=1 hash=0x... deps=1
+  stage 2 [cost=1] 1 node(s):
+    op=5 cost=1 hash=0x... deps=1
+  stage 3 [cost=10] 1 node(s):
+    op=3 cost=10 hash=0x... deps=1
+interner pool:
+  [0] op=4 hash=0x... refs=1 cost=1 deps=0
+  ...
+```
+
+Run the same pipeline twice to observe deduplication — the pool count stays constant on the second call as existing nodes are retained rather than reallocated.
 
 ---
 
