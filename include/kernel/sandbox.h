@@ -58,7 +58,8 @@ typedef enum {
     OP_SLEEP      = 8,  /* Busy-wait N milliseconds — robot timing/PWM    */
     OP_INTROSPECT = 9,  /* Print whitelisted MMIO map as name:address pairs*/
     OP_WAIT_EVENT = 10, /* Yield until next IRQ tick (stub; becomes async) */
-    OP_INVALID    = 11, /* Sentinel — any value >= OP_INVALID is illegal   */
+    OP_RESPOND    = 11, /* Emit structured RESPOND:{...} JSON result packet */
+    OP_INVALID    = 12, /* Sentinel — any value >= OP_INVALID is illegal   */
 } sandbox_opcode_t;
 
 /* ---- Comparison operators (BinaryExpression operators from AIQL) -------- */

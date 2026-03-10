@@ -40,6 +40,7 @@ Requirements:
 
 import os
 import sys
+import threading
 import json
 import time
 import socket
@@ -149,6 +150,73 @@ def recv_until_prompt(sock, timeout=15.0):
             if _strip_ansi(buf.decode("utf-8", errors="replace")).rstrip().endswith(PROMPT.rstrip()):
                 break
     return buf.decode("utf-8", errors="replace")
+
+def parse_respond(lines: list) -> dict | None:
+    """
+    Scan output lines for a RESPOND:{...} packet.
+    Returns parsed dict if found, None otherwise.
+    """
+    import json as _json
+    for line in lines:
+        if line.startswith("RESPOND:"):
+            try:
+                return _json.loads(line[8:])
+            except _json.JSONDecodeError:
+                pass
+    return None
+
+
+# ── Reflex listener ─────────────────────────────────────────────────────────
+# Runs in a background thread. Drains RESPOND: packets emitted by
+# IRQ-triggered AIQL programs (timer reflexes, sensor events) and
+# queues them for the main agent loop to observe.
+
+_reflex_queue: list = []
+_reflex_lock = threading.Lock()
+_reflex_active = False
+
+def _reflex_reader(sock):
+    """Background thread: read lines, queue any RESPOND: packets."""
+    buf = b""
+    while _reflex_active:
+        try:
+            chunk = sock.recv(256)
+            if not chunk:
+                break
+            buf += chunk
+            while b"\n" in buf or b"\r" in buf:
+                line, _, buf = buf.partition(b"\n")
+                line = _strip_ansi(line.decode("utf-8", errors="replace")).strip()
+                if line.startswith("RESPOND:"):
+                    try:
+                        import json as _j
+                        data = _j.loads(line[8:])
+                        with _reflex_lock:
+                            _reflex_queue.append(data)
+                        print(c(f"\n  [reflex]  {line}", C.AIQL + C.BOLD), flush=True)
+                    except Exception:
+                        pass
+        except Exception:
+            break
+
+def start_reflex_listener(sock):
+    global _reflex_active
+    _reflex_active = True
+    t = threading.Thread(target=_reflex_reader, args=(sock,), daemon=True)
+    t.start()
+    return t
+
+def stop_reflex_listener():
+    global _reflex_active
+    _reflex_active = False
+
+def drain_reflexes() -> list:
+    """Return and clear all queued reflex packets."""
+    with _reflex_lock:
+        packets = list(_reflex_queue)
+        _reflex_queue.clear()
+    return packets
+
 
 def drain(sock):
     sock.settimeout(0.05)
@@ -276,6 +344,37 @@ The compiler maps Operation/CallStatement names to KAI opcodes:
   Anything else                         → echo stub (use for reasoning steps)
 
 CallStatement with call_type "llm" or "classifier" emits an echo stub.
+
+═══════════════════════════════════════════════
+TIMER REFLEXES (IRQ-triggered autonomous pipelines)
+═══════════════════════════════════════════════
+
+You can register an AIQL program to fire autonomously on a hardware timer.
+Use the `timer_bind` shell command as a single-step pipeline Operation:
+
+  Operation name: "BindTimerReflex"
+  params: { "interval_ms": 1000, "goal": "heartbeat" }
+
+The bridge will send:
+  timer_bind 1000 {"type":"Program","intent":{"goal":"heartbeat"},...}
+
+The kernel will then fire that AIQL program every 1000ms via IRQ 27.
+Each firing emits a RESPOND: packet you'll see as [reflex] in the output.
+
+Use timer reflexes to:
+  - Poll hardware state periodically without agent commands
+  - Set up a "watchdog" that reports anomalies autonomously
+  - Establish a heartbeat so the agent knows the kernel is alive
+
+ALWAYS end your final pipeline with a respond operation:
+{
+  "type": "Operation",
+  "name": "RespondWithResult",
+  "params": { "goal": "your_goal_label" }
+}
+
+This emits a RESPOND:{...} packet the bridge parses directly — you get
+typed values (caps, el, vars) instead of raw text to interpret.
 Full model dispatch is a future kai_executor layer.
 
 ═══════════════════════════════════════════════
@@ -400,6 +499,9 @@ def run_agent(goal, sock, provider, model, max_steps, dump_aiql, verbose):
         for line in boot_lines:
             log_kernel(line)
 
+    # Start background reflex listener for IRQ-fired RESPOND: packets
+    start_reflex_listener(sock)
+
     messages = [
         {
             "role": "user",
@@ -485,30 +587,59 @@ def run_agent(goal, sock, provider, model, max_steps, dump_aiql, verbose):
             log_kernel(line)
         output_text = "\n".join(output_lines) if output_lines else "(no output)"
 
+        # ── Parse RESPOND: packet if present ──────────────────────────────
+        respond_data = parse_respond(output_lines)
+        if respond_data:
+            print(c(f"  [respond] {json.dumps(respond_data)}", C.AIQL))
+
         # ── Check success_metric ───────────────────────────────────────────
         intent = aiql_program.get("intent", {})
         if isinstance(intent, dict):
             metric = intent.get("success_metric", "")
             if metric:
-                # Build a simple context from output lines
-                context = {"output": output_text, "step_count": step}
+                context = {"step_count": step}
+                if respond_data:
+                    context.update(respond_data)
+                    context.update(respond_data.get("vars", {}))
                 passed = evaluate_success_metric(metric, context)
                 status = "PASS" if passed else "FAIL"
                 print(c(f"  [metric] {metric} → {status}", C.AIQL))
 
         # ── Feed result back ───────────────────────────────────────────────
+        # ── Collect any IRQ-fired reflex packets ──────────────────────────
+        reflex_packets = drain_reflexes()
+        if reflex_packets:
+            print(c(f"  [reflexes] {len(reflex_packets)} packet(s) from IRQ handlers", C.AIQL))
+
         messages.append({"role": "assistant", "content": raw})
-        messages.append({
-            "role": "user",
-            "content": (
-                f"AIQL program executed. "
-                f"{len(pipelines)} pipeline(s) ran.\n\n"
+
+        if respond_data:
+            # Structured path: LLM gets typed values, not raw text
+            reflex_str = ""
+            if reflex_packets:
+                reflex_str = f"\n\nIRQ reflex packets received ({len(reflex_packets)}):\n"
+                reflex_str += "\n".join(json.dumps(r, indent=2) for r in reflex_packets)
+            feedback = (
+                f"AIQL program executed successfully.\n\n"
+                f"Structured result (RESPOND packet):\n"
+                f"{json.dumps(respond_data, indent=2)}\n\n"
+                f"Raw output (for context):\n{output_text}"
+                f"{reflex_str}\n\n"
+                f"Steps remaining: {max_steps - step}\n\n"
+                "The RESPOND packet gives you typed values from the kernel. "
+                "Use them to determine if the goal is achieved or plan the next step."
+            )
+        else:
+            # Unstructured path: raw UART text
+            feedback = (
+                f"AIQL program executed. No RESPOND packet emitted.\n\n"
                 f"Kernel output:\n{output_text}\n\n"
                 f"Steps remaining: {max_steps - step}\n\n"
-                "Analyse the output, update your understanding of the kernel state, "
-                "and either generate the next AIQL program or declare done."
+                "Tip: add a respond operation as the final step of your pipeline "
+                "to emit a structured result packet for reliable parsing."
             )
-        })
+
+        messages.append({"role": "user", "content": feedback})
 
     print()
     log_error(f"Step budget exhausted after {step} steps.")
@@ -564,6 +695,7 @@ def main():
             dump_aiql=args.dump_aiql,
             verbose=args.verbose,
         )
+        stop_reflex_listener()
         sock.close()
         sys.exit(0 if success else 1)
     except RuntimeError as e:

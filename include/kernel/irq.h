@@ -56,12 +56,26 @@ extern "C" {
 #define IRQ_PIPELINE_SLOTS   8U    /* Max IRQ-to-pipeline bindings           */
 #define IRQ_MAX_SPI          96U   /* Max SPI IRQ number supported           */
 
-/* ---- IRQ-to-pipeline binding -------------------------------------------- */
+/* ---- ARM Generic Timer (PPI IRQ 27) ------------------------------------- */
+#define IRQ_TIMER_PPI        27U   /* EL1 physical timer PPI                 */
+#define CNTP_CTL_ENABLE      (1U << 0)  /* Timer enable bit                  */
+#define CNTP_CTL_IMASK       (1U << 1)  /* Interrupt mask (0=unmasked)        */
+#define CNTP_CTL_ISTATUS     (1U << 2)  /* Condition met (read-only)          */
+
+/* ---- IRQ-to-AIQL binding ------------------------------------------------ */
+/*
+ * Upgraded from pipeline_t* to aiql_program_t so full AIQL programs
+ * (multi-pipeline, with RESPOND: output) can fire on hardware events.
+ * The program is verified at bind time; dispatch just executes.
+ */
+#include <kernel/aiql.h>
+
 typedef struct {
-    uint32_t         irq_num;   /* GIC interrupt number (SPI)               */
-    const pipeline_t *pipeline; /* Pre-verified pipeline to run on trigger   */
-    sandbox_ctx_t    *ctx;      /* Sandbox context to execute within         */
-    bool             active;    /* Slot is in use                            */
+    uint32_t        irq_num;        /* GIC interrupt number                  */
+    aiql_program_t  program;        /* Full AIQL program (copied at bind)    */
+    sandbox_ctx_t  *ctx;            /* Sandbox context                       */
+    bool            active;         /* Slot in use                           */
+    uint32_t        fire_count;     /* How many times this IRQ has fired     */
 } irq_pipeline_binding_t;
 
 /* ---- Public API --------------------------------------------------------- */
@@ -91,8 +105,26 @@ void irq_init(void);
  * is out of range.
  */
 bool irq_register_pipeline(uint32_t irq_num,
-                            const pipeline_t *pipeline,
+                            const aiql_program_t *program,
                             sandbox_ctx_t *ctx);
+
+/*
+ * timer_init — configure the ARM generic timer to fire at interval_ms.
+ *
+ * Sets CNTP_TVAL_EL0 and enables the EL1 physical timer. Fires PPI IRQ 27.
+ * Call irq_register_pipeline(IRQ_TIMER_PPI, ...) first, then timer_init().
+ */
+void timer_init(uint32_t interval_ms);
+
+/*
+ * timer_reload — reset the timer countdown (call from IRQ handler to repeat).
+ */
+void timer_reload(uint32_t interval_ms);
+
+/*
+ * irq_list — print all active bindings over UART.
+ */
+void irq_list(uint32_t caps);
 
 /*
  * irq_enable — unmask a specific interrupt at the GIC distributor level.

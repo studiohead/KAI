@@ -105,6 +105,9 @@ static void cmd_dag(const char *args, ai_session_t *session);
 static void cmd_irq(const char *args, ai_session_t *session);
 static void cmd_irq_bind(const char *args, ai_session_t *session);
 static void cmd_aiql(const char *args, ai_session_t *session);
+static void cmd_aiql_bind(const char *args, ai_session_t *session);
+static void cmd_timer_bind(const char *args, ai_session_t *session);
+static void cmd_irq_list(const char *args, ai_session_t *session);
 
 /* ---- Command table --------------------------------------------------- */
 static const command_t commands[] = {
@@ -119,7 +122,10 @@ static const command_t commands[] = {
     { "dag",      "Build DAG from pipeline and show schedule", cmd_dag     },
     { "irq_init", "Enable CPU IRQ delivery (start reflexes)", cmd_irq      },
     { "irq_bind", "Bind IRQ <num> to <pipeline>",            cmd_irq_bind },
-    { "aiql",     "Execute an AIQL JSON program directly",     cmd_aiql     },
+    { "aiql",       "Execute an AIQL JSON program directly",       cmd_aiql      },
+    { "aiql_bind",  "Bind AIQL JSON to IRQ: aiql_bind <irq> <json>",  cmd_aiql_bind },
+    { "timer_bind", "Arm timer reflex: timer_bind <ms> <json>",        cmd_timer_bind},
+    { "irq_list",   "List all active IRQ->AIQL bindings",              cmd_irq_list  },
 };
 
 #define NUM_COMMANDS  (sizeof(commands) / sizeof(commands[0]))
@@ -212,7 +218,7 @@ static void cmd_irq(const char *args, ai_session_t *session)
     sys_uart_write("IRQ dispatch enabled. PSTATE.I unmasked.\r\n", KSTRLEN("IRQ dispatch enabled. PSTATE.I unmasked.\r\n"), session->caps);
 }
 
-/* Bind an AI reflex to hardware */
+/* Bind an AI reflex to hardware (pipeline string → wrapped in aiql_program_t) */
 static void cmd_irq_bind(const char *args, ai_session_t *session)
 {
     if (!args || args[0] == '\0') {
@@ -223,19 +229,30 @@ static void cmd_irq_bind(const char *args, ai_session_t *session)
     uint32_t irq_num = 0;
     const char *p = args;
     while (*p >= '0' && *p <= '9') {
-        irq_num = irq_num * 10 + (*p - '0');
+        irq_num = irq_num * 10 + (uint32_t)(*p - '0');
         p++;
     }
     while (*p == ' ') p++;
 
-    static pipeline_t reflex_pipe; 
-    if (interpreter_parse_pipeline(p, &reflex_pipe)) {
-        if (irq_register_pipeline(irq_num, &reflex_pipe, &sb_ctx)) {
-            irq_enable(irq_num);
-            sys_uart_write("IRQ bound and enabled.\r\n", KSTRLEN("IRQ bound and enabled.\r\n"), session->caps);
-        }
-    } else {
+    /* Parse pipeline string into a single-pipeline aiql_program_t */
+    static aiql_program_t bind_prog;
+    k_memset(&bind_prog, 0, sizeof(bind_prog));
+
+    if (!interpreter_parse_pipeline(p, &bind_prog.pipelines[0])) {
         sys_uart_write("Error parsing pipeline.\r\n", KSTRLEN("Error parsing pipeline.\r\n"), session->caps);
+        return;
+    }
+    if (!verifier_check_pipeline(&bind_prog.pipelines[0], session->caps)) {
+        sys_uart_write("Pipeline verification failed.\r\n", KSTRLEN("Pipeline verification failed.\r\n"), session->caps);
+        return;
+    }
+    bind_prog.pipeline_count = 1;
+
+    if (irq_register_pipeline(irq_num, &bind_prog, &sb_ctx)) {
+        irq_enable(irq_num);
+        sys_uart_write("IRQ bound and enabled.\r\n", KSTRLEN("IRQ bound and enabled.\r\n"), session->caps);
+    } else {
+        sys_uart_write("Registration failed (bad irq or slots full).\r\n", KSTRLEN("Registration failed (bad irq or slots full).\r\n"), session->caps);
     }
 }
 
@@ -373,6 +390,126 @@ static void cmd_aiql(const char *args, ai_session_t *session)
 
     /* ---- Execute -------------------------------------------------------- */
     aiql_execute_program(&prog, &sb_ctx, session->caps);
+}
+
+
+/* ---- aiql_bind — bind an AIQL JSON program to a hardware IRQ ------------ */
+static void cmd_aiql_bind(const char *args, ai_session_t *session)
+{
+    if (!args || args[0] == '\0') {
+        uart_puts("usage: aiql_bind <irq_num> <json>\r\n");
+        return;
+    }
+
+    /* Parse IRQ number */
+    uint32_t irq_num = 0;
+    const char *p = args;
+    while (*p >= '0' && *p <= '9') { irq_num = irq_num * 10 + (uint32_t)(*p - '0'); p++; }
+    while (*p == ' ') p++;
+
+    if (*p != '{') {
+        uart_puts("[aiql_bind] expected JSON after irq number\r\n");
+        return;
+    }
+
+    /* Extract AIQL */
+    size_t json_len = k_strlen(p);
+    if (json_len >= AIQL_BUF_SIZE) {
+        uart_puts("[aiql_bind] JSON too large\r\n");
+        return;
+    }
+
+    static aiql_program_t bind_prog;
+    aiql_err_t err = aiql_extract(p, json_len, &bind_prog);
+    if (err != AIQL_OK) {
+        uart_puts("[aiql_bind] extract error: ");
+        uart_puts(aiql_err_str(err));
+        uart_puts("\r\n");
+        return;
+    }
+
+    if (!irq_register_pipeline(irq_num, &bind_prog, &sb_ctx)) {
+        uart_puts("[aiql_bind] registration failed (bad irq or slots full)\r\n");
+        return;
+    }
+
+    irq_enable(irq_num);
+    uart_puts("[aiql_bind] bound irq ");
+    sys_uart_hex64((uint64_t)irq_num, session->caps);
+    uart_puts(" goal=");
+    uart_puts(bind_prog.goal[0] ? bind_prog.goal : "(none)");
+    uart_puts("\r\n");
+}
+
+/* ---- timer_bind — arm the generic timer and bind an AIQL reflex --------- */
+/*
+ * Usage: timer_bind <interval_ms> <aiql_json>
+ *
+ * Configures the ARM EL1 physical timer (PPI IRQ 27) to fire every
+ * interval_ms milliseconds. On each tick the AIQL program executes
+ * and emits a RESPOND: packet. The agent bridge picks these up
+ * asynchronously between its own command sends.
+ *
+ * Example:
+ *   timer_bind 500 {"type":"Program","intent":{"goal":"heartbeat"},...}
+ */
+static void cmd_timer_bind(const char *args, ai_session_t *session)
+{
+    if (!args || args[0] == '\0') {
+        uart_puts("usage: timer_bind <ms> <json>\r\n");
+        return;
+    }
+
+    uint32_t ms = 0;
+    const char *p = args;
+    while (*p >= '0' && *p <= '9') { ms = ms * 10 + (uint32_t)(*p - '0'); p++; }
+    while (*p == ' ') p++;
+
+    if (ms == 0 || ms > 60000U) {
+        uart_puts("[timer_bind] interval must be 1–60000 ms\r\n");
+        return;
+    }
+
+    if (*p != '{') {
+        uart_puts("[timer_bind] expected JSON after interval\r\n");
+        return;
+    }
+
+    size_t json_len = k_strlen(p);
+    if (json_len >= AIQL_BUF_SIZE) {
+        uart_puts("[timer_bind] JSON too large\r\n");
+        return;
+    }
+
+    static aiql_program_t timer_prog;
+    aiql_err_t err = aiql_extract(p, json_len, &timer_prog);
+    if (err != AIQL_OK) {
+        uart_puts("[timer_bind] extract error: ");
+        uart_puts(aiql_err_str(err));
+        uart_puts("\r\n");
+        return;
+    }
+
+    if (!irq_register_pipeline(IRQ_TIMER_PPI, &timer_prog, &sb_ctx)) {
+        uart_puts("[timer_bind] registration failed\r\n");
+        return;
+    }
+
+    timer_init(ms);
+    irq_enable_in_cpu();   /* ensure CPU is accepting IRQs */
+
+    uart_puts("[timer_bind] armed: every ");
+    sys_uart_hex64((uint64_t)ms, session->caps);
+    uart_puts("ms, goal=");
+    uart_puts(timer_prog.goal[0] ? timer_prog.goal : "(none)");
+    uart_puts("\r\n");
+}
+
+/* ---- irq_list — show active bindings ------------------------------------ */
+static void cmd_irq_list(const char *args, ai_session_t *session)
+{
+    (void)args;
+    irq_list(session->caps);
 }
 
 /* Help list */

@@ -47,6 +47,7 @@ static const opcode_entry_t opcode_table[] = {
     { "sleep",      OP_SLEEP      },
     { "introspect", OP_INTROSPECT },
     { "wait_event", OP_WAIT_EVENT },
+    { "respond",    OP_RESPOND    },
 };
 
 #define OPCODE_TABLE_SIZE (sizeof(opcode_table) / sizeof(opcode_table[0]))
@@ -606,6 +607,91 @@ sandbox_result_t interpreter_exec(ast_node_t *node, sandbox_ctx_t *ctx)
              */
             __asm__ volatile ("wfe");
             break;
+
+        case OP_RESPOND: {
+            /*
+             * Emit a structured RESPOND:{...} JSON packet on UART.
+             *
+             * Format:
+             *   RESPOND:{"status":"ok","goal":"<arg0>","vars":{<var_store>},"caps":"0x...","el":<N>}
+             *
+             * The agent bridge detects lines beginning with "RESPOND:" and
+             * parses the JSON rather than treating it as free-form output.
+             * This gives the LLM typed values instead of text to interpret.
+             *
+             * Usage in AIQL:
+             *   respond system_state         — goal label from arg0
+             *   respond                      — anonymous respond
+             */
+
+            /* --- helpers: write key:"hex" and key:N ------------------- */
+            #define UART_STR(s)  sys_uart_write((s), k_strlen(s), ctx->caps)
+            #define UART_CHR(c)  do { char _c=(c); sys_uart_write(&_c,1,ctx->caps); } while(0)
+
+            UART_STR("RESPOND:{");
+
+            /* status */
+            UART_STR("\"status\":\"ok\"");
+
+            /* goal — from arg0 if provided */
+            if (node->argc > 0 && node->args[0][0] != '\0') {
+                UART_STR(",\"goal\":\"");
+                UART_STR(node->args[0]);
+                UART_CHR('"');
+            }
+
+            /* caps */
+            UART_STR(",\"caps\":\"0x");
+            {
+                uint64_t v = (uint64_t)ctx->caps;
+                char hex[17]; int hi = 16; hex[hi] = '\0';
+                do {
+                    uint8_t n = (uint8_t)(v & 0xFU);
+                    hex[--hi] = n < 10u ? (char)('0'+n) : (char)('a'+n-10);
+                    v >>= 4;
+                } while (v && hi > 0);
+                UART_STR(hex + hi);
+            }
+            UART_CHR('"');
+
+            /* el */
+            {
+                uint64_t el;
+                __asm__ volatile ("mrs %0, CurrentEL" : "=r" (el));
+                uint32_t el_val = (uint32_t)((el >> 2U) & 3U);
+                UART_STR(",\"el\":"); UART_CHR((char)('0' + el_val));
+            }
+
+            /* var store — emit every set variable as key:value */
+            bool first_var = true;
+            UART_STR(",\"vars\":{");
+            for (size_t vi = 0; vi < VAR_STORE_SIZE; vi++) {
+                var_entry_t *ve = &ctx->vars.entries[vi];
+                if (!ve->set || ve->name[0] == '\0') continue;
+                if (!first_var) UART_CHR(',');
+                first_var = false;
+                UART_CHR('"');
+                UART_STR(ve->name);
+                UART_STR("\":{\"v\":\"0x");
+                /* hex encode value */
+                uint64_t v = ve->value;
+                char hex[17]; int hi = 16; hex[hi] = '\0';
+                do {
+                    uint8_t n = (uint8_t)(v & 0xFU);
+                    hex[--hi] = n < 10u ? (char)('0'+n) : (char)('a'+n-10);
+                    v >>= 4;
+                } while (v && hi > 0);
+                UART_STR(hex + hi);
+                UART_STR("\"}");
+            }
+            UART_CHR('}');
+
+            UART_STR("}\r\n");
+
+            #undef UART_STR
+            #undef UART_CHR
+            break;
+        }
 
         default:
             return SANDBOX_ERR_UNKNOWN;
