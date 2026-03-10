@@ -25,6 +25,7 @@
 #include <kernel/syscall.h>
 #include <kernel/memory.h>
 #include <kernel/string.h>
+#include <kernel/uart.h>
 #include <stdint.h>
 #include <stddef.h>
 #include <stdbool.h>
@@ -48,6 +49,7 @@ static const opcode_entry_t opcode_table[] = {
     { "introspect", OP_INTROSPECT },
     { "wait_event", OP_WAIT_EVENT },
     { "respond",    OP_RESPOND    },
+    { "model_call", OP_MODEL_CALL },
 };
 
 #define OPCODE_TABLE_SIZE (sizeof(opcode_table) / sizeof(opcode_table[0]))
@@ -166,6 +168,46 @@ static bool eval_cond(const pipeline_cond_t *cond,
 }
 
 /* ======================================================================
+ * str_store helpers
+ * ====================================================================== */
+bool str_store_set(str_store_t *store, const char *name, const char *value)
+{
+    if (!store || !name || !value) return false;
+    /* Update existing */
+    for (size_t i = 0; i < STR_STORE_SIZE; i++) {
+        if (store->entries[i].set &&
+            k_strcmp(store->entries[i].name, name) == 0) {
+            safe_strcpy(store->entries[i].value, value, MODEL_RESULT_MAX_LEN);
+            return true;
+        }
+    }
+    /* New entry */
+    for (size_t i = 0; i < STR_STORE_SIZE; i++) {
+        if (!store->entries[i].set) {
+            safe_strcpy(store->entries[i].name,  name,  SANDBOX_ARG_MAX_LEN);
+            safe_strcpy(store->entries[i].value, value, MODEL_RESULT_MAX_LEN);
+            store->entries[i].set = true;
+            return true;
+        }
+    }
+    return false;
+}
+
+bool str_store_get(const str_store_t *store, const char *name,
+                   char *out, size_t max)
+{
+    if (!store || !name || !out || max == 0) return false;
+    for (size_t i = 0; i < STR_STORE_SIZE; i++) {
+        if (store->entries[i].set &&
+            k_strcmp(store->entries[i].name, name) == 0) {
+            safe_strcpy(out, store->entries[i].value, max);
+            return true;
+        }
+    }
+    return false;
+}
+
+/* ======================================================================
  * interpreter_parse — single tool call into ast_node_t
  * ====================================================================== */
 bool interpreter_parse(const char *input, ast_node_t *out_node)
@@ -226,6 +268,10 @@ bool interpreter_parse(const char *input, ast_node_t *out_node)
     out_node->argc = argc;
     return true;
 }
+
+/* ======================================================================
+ * str_store helpers
+ * ====================================================================== */
 
 /* ======================================================================
  * interpreter_parse_pipeline — semicolon-separated steps into pipeline_t
@@ -693,6 +739,108 @@ sandbox_result_t interpreter_exec(ast_node_t *node, sandbox_ctx_t *ctx)
             break;
         }
 
+        case OP_MODEL_CALL: {
+            /*
+             * EXEC: protocol — synchronous host LLM/classifier call.
+             *
+             * 1. Emit EXEC:{...} JSON line on UART
+             * 2. Block reading UART lines until "RESULT:{...}" arrives
+             * 3. Parse result value, store in var_store (hash) and str_store
+             *
+             * The host bridge (kai_agent.py) intercepts EXEC: before the
+             * prompt returns, makes the actual API call, and writes RESULT:.
+             *
+             * EXEC packet format:
+             *   EXEC:{"type":"llm","action":"<action>","input":"<input>",
+             *          "output_var":"<var>","seq":<n>}
+             *
+             * RESULT packet format (host writes this):
+             *   RESULT:{"value":"<text>","seq":<n>}
+             */
+
+            #define USTR(s)  sys_uart_write((s), k_strlen(s), ctx->caps)
+            #define UCHR(c)  do { char _c=(c); sys_uart_write(&_c,1,ctx->caps); } while(0)
+
+            /* Build and emit EXEC packet */
+            USTR("EXEC:{");
+            USTR("\"type\":\"");
+            USTR("llm");  /* model_type not available in single-shot exec */
+            USTR("\",\"action\":\"");
+            USTR("call");  /* model_action not available in single-shot exec */
+            USTR("\",\"input\":\"");
+            /* Emit input, escaping quotes and backslashes */
+            for (const char *ip = ""; *ip; ip++) {  /* no input in ast_node_t */
+                if (*ip == '"'  || *ip == '\\') UCHR('\\');
+                UCHR(*ip);
+            }
+            USTR("\"");
+            /* output_var not on ast_node_t — omit from single-shot exec */
+            USTR("}\r\n");
+
+            /* Block-read UART lines until RESULT: arrives (or 512 chars timeout) */
+            char result_buf[MODEL_RESULT_MAX_LEN];
+            k_memset(result_buf, 0, sizeof(result_buf));
+            bool got_result = false;
+
+            /* Read up to 4 lines looking for RESULT: */
+            for (int attempt = 0; attempt < 4 && !got_result; attempt++) {
+                char line[MODEL_RESULT_MAX_LEN];
+                size_t li = 0;
+                /* Read one line (CR or LF terminated) */
+                while (li < sizeof(line) - 1U) {
+                    char rc = uart_getc();
+                    if (rc == '\r' || rc == '\n') {
+                        if (li > 0) break;
+                        continue;
+                    }
+                    line[li++] = rc;
+                }
+                line[li] = '\0';
+
+                /* Check for RESULT: prefix */
+                if (k_strncmp(line, "RESULT:", 7) == 0) {
+                    /* Extract "value" field from JSON: RESULT:{"value":"..."} */
+                    /* value key scanned inline below */
+                    size_t vklen = 8; /* len of value":" */
+                    /* Simple scan for "value":"  */
+                    for (size_t si = 7; si + vklen < li; si++) {
+                        if (k_strncmp(line + si, "\"value\":\"", 10) == 0) {
+                            const char *vs = line + si + 10;
+                            size_t vi2 = 0;
+                            while (*vs && *vs != '"' && vi2 < sizeof(result_buf)-1)
+                                result_buf[vi2++] = *vs++;
+                            result_buf[vi2] = '\0';
+                            got_result = true;
+                            break;
+                        }
+                    }
+                    if (!got_result) {
+                        /* Fallback: take everything after RESULT: as raw value */
+                        safe_strcpy(result_buf, line + 7, sizeof(result_buf));
+                        got_result = true;
+                    }
+                }
+            }
+
+            if (!got_result) {
+                /* Timeout — store empty string, pipeline continues */
+                safe_strcpy(result_buf, "timeout", sizeof(result_buf));
+            }
+
+            /* Store string result */
+            /* output_var storage skipped in single-shot interpreter_exec */
+            (void)result_buf;
+
+            /* Echo result to UART for visibility */
+            USTR("[model] result: ");
+            USTR(result_buf);
+            USTR("\r\n");
+
+            #undef USTR
+            #undef UCHR
+            break;
+        }
+
         default:
             return SANDBOX_ERR_UNKNOWN;
     }
@@ -788,6 +936,73 @@ sandbox_result_t interpreter_exec_pipeline(pipeline_t *pipeline,
                     i++;
                 }
             }
+            continue;
+        }
+
+        /* ---- OP_MODEL_CALL: dispatch directly with pipeline_node_t fields */
+        if (step->opcode == OP_MODEL_CALL) {
+            ctx->instruction_count++;
+            #define PSTR(s)  sys_uart_write((s), k_strlen(s), ctx->caps)
+            #define PCHR(c)  do { char _pc=(c); sys_uart_write(&_pc,1,ctx->caps); } while(0)
+
+            PSTR("EXEC:{");
+            PSTR("\"type\":\"");
+            PSTR(step->model_type[0] ? step->model_type : "llm");
+            PSTR("\",\"action\":\"");
+            PSTR(step->model_action[0] ? step->model_action : "call");
+            PSTR("\",\"input\":\"");
+            for (const char *ip = step->model_input; *ip; ip++) {
+                if (*ip == '"' || *ip == '\\') PCHR('\\');
+                PCHR(*ip);
+            }
+            PSTR("\"");
+            if (step->output_var[0]) {
+                PSTR(",\"output_var\":\"");
+                PSTR(step->output_var);
+                PCHR('"');
+            }
+            PSTR("}\r\n");
+
+            /* Block-read until RESULT: */
+            char pbuf[MODEL_RESULT_MAX_LEN];
+            k_memset(pbuf, 0, sizeof(pbuf));
+            bool pgot = false;
+            for (int att = 0; att < 8 && !pgot; att++) {
+                char pline[MODEL_RESULT_MAX_LEN];
+                size_t pli = 0;
+                while (pli < sizeof(pline) - 1U) {
+                    char rc = uart_getc();
+                    if (rc == '\r' || rc == '\n') { if (pli > 0) break; continue; }
+                    pline[pli++] = rc;
+                }
+                pline[pli] = '\0';
+                if (k_strncmp(pline, "RESULT:", 7) == 0) {
+                    for (size_t si = 7; si + 9 < pli; si++) {
+                        if (k_strncmp(pline + si, "\"value\":\"", 10) == 0) {
+                            const char *vs = pline + si + 10;
+                            size_t vi2 = 0;
+                            while (*vs && *vs != '"' && vi2 < sizeof(pbuf)-1)
+                                pbuf[vi2++] = *vs++;
+                            pbuf[vi2] = '\0';
+                            pgot = true; break;
+                        }
+                    }
+                    if (!pgot) { safe_strcpy(pbuf, pline + 7, sizeof(pbuf)); pgot = true; }
+                }
+            }
+            if (!pgot) safe_strcpy(pbuf, "timeout", sizeof(pbuf));
+
+            if (step->output_var[0]) {
+                str_store_set(&ctx->str_vars, step->output_var, pbuf);
+                uint64_t hash = 5381ULL;
+                for (const char *hp = pbuf; *hp; hp++)
+                    hash = ((hash << 5) + hash) ^ (uint64_t)(unsigned char)*hp;
+                var_store_set(&ctx->vars, step->output_var, hash);
+            }
+            PSTR("[model] "); PSTR(pbuf); PSTR("\r\n");
+            #undef PSTR
+            #undef PCHR
+            i++;
             continue;
         }
 

@@ -166,6 +166,88 @@ def parse_respond(lines: list) -> dict | None:
     return None
 
 
+# ── kai_executor — host-side model call handler ─────────────────────────────
+# Intercepts EXEC:{...} packets emitted by OP_MODEL_CALL, makes the actual
+# API call, and writes RESULT:{...} back over the socket synchronously.
+
+def _make_model_call(exec_data: dict, provider: str, model: str,
+                     api_key: str) -> str:
+    """
+    Dispatch a model call based on exec_data type/action.
+    Returns the result string to send back to the kernel.
+    """
+    call_type  = exec_data.get("type",   "llm")
+    action     = exec_data.get("action", "call")
+    input_text = exec_data.get("input",  "")
+
+    if not input_text:
+        return "error:no-input"
+
+    prompt = (
+        f"You are a kernel-embedded AI. Answer concisely in one short phrase "
+        f"(no punctuation, no newlines). "
+        f"Action: {action}\n"
+        f"Input: {input_text}"
+    )
+
+    try:
+        if provider == "anthropic":
+            import anthropic
+            client = anthropic.Anthropic(api_key=api_key)
+            msg = client.messages.create(
+                model=model,
+                max_tokens=64,
+                messages=[{"role": "user", "content": prompt}]
+            )
+            return msg.content[0].text.strip().replace("\n", " ")[:MODEL_RESULT_MAX_LEN]
+
+        elif provider == "openai":
+            import openai
+            client = openai.OpenAI(api_key=api_key)
+            resp = client.chat.completions.create(
+                model=model,
+                max_tokens=64,
+                messages=[{"role": "user", "content": prompt}]
+            )
+            return resp.choices[0].message.content.strip().replace("\n", " ")[:MODEL_RESULT_MAX_LEN]
+
+        else:
+            return f"error:unknown-provider:{provider}"
+
+    except Exception as e:
+        return f"error:{str(e)[:48]}"
+
+
+MODEL_RESULT_MAX_LEN = 240  # matches kernel MODEL_RESULT_MAX_LEN
+
+
+def handle_exec_packet(sock, line: str, provider: str, model: str,
+                       api_key: str) -> bool:
+    """
+    Called when a line starting with EXEC: is received from the kernel.
+    Makes the model call synchronously and writes RESULT: back.
+    Returns True if handled.
+    """
+    if not line.startswith("EXEC:"):
+        return False
+    try:
+        exec_data = json.loads(line[5:])
+    except json.JSONDecodeError:
+        # Malformed — send error result
+        exec_data = {}
+
+    print(c(f"  [exec]   {json.dumps(exec_data)}", C.AIQL), flush=True)
+
+    result_str = _make_model_call(exec_data, provider, model, api_key)
+    result_str = result_str.replace('"', "'").replace("\\", "/")  # safe for JSON
+
+    print(c(f"  [result] {result_str}", C.AIQL), flush=True)
+
+    result_pkt = json.dumps({"value": result_str}) + "\r\n"
+    sock.sendall(result_pkt.encode("utf-8"))
+    return True
+
+
 # ── Reflex listener ─────────────────────────────────────────────────────────
 # Runs in a background thread. Drains RESPOND: packets emitted by
 # IRQ-triggered AIQL programs (timer reflexes, sensor events) and
@@ -343,7 +425,24 @@ The compiler maps Operation/CallStatement names to KAI opcodes:
   Names containing: caps, capabilities  → OP_CAPS
   Anything else                         → echo stub (use for reasoning steps)
 
-CallStatement with call_type "llm" or "classifier" emits an echo stub.
+CallStatement with call_type "llm" or "classifier" triggers a REAL model call
+via the EXEC: protocol. The kernel emits EXEC:{...}, the host bridge makes the
+API call, and writes RESULT:{...} back. The result is stored in output_var.
+
+Example CallStatement that classifies sensor data:
+{
+  "type": "CallStatement",
+  "call_type": "classifier",
+  "action": "classify_reading",
+  "outputs": ["classification"],
+  "params": {
+    "input": "sensor value 42, threshold 100, context: temperature monitor"
+  }
+}
+
+The result string is stored in "classification" in the variable store.
+You can then branch on it with a ConditionalStatement, or include it in
+a RespondWithResult operation.
 
 ═══════════════════════════════════════════════
 TIMER REFLEXES (IRQ-triggered autonomous pipelines)
@@ -582,7 +681,7 @@ def run_agent(goal, sock, provider, model, max_steps, dump_aiql, verbose):
         aiql_json = json.dumps(aiql_program, separators=(',', ':'))
         cmd = f"aiql {aiql_json}"
         log_aiql(aiql_program)
-        output_lines = send_command(sock, cmd)
+        output_lines = send_command(sock, cmd, provider=provider, model=model, api_key=api_key)
         for line in output_lines:
             log_kernel(line)
         output_text = "\n".join(output_lines) if output_lines else "(no output)"

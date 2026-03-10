@@ -45,6 +45,7 @@ static const uint32_t opcode_required_caps[OP_INVALID] = {
     [OP_INTROSPECT]  = CAP_MMIO,   /* Prints MMIO map to UART                   */
     [OP_WAIT_EVENT]  = CAP_NONE,   /* Yield stub — no privileged access         */
     [OP_RESPOND]    = CAP_MMIO,   /* Emits JSON packet over UART               */
+    [OP_MODEL_CALL] = CAP_MMIO,   /* EXEC: protocol over UART                  */
 };
 
 /* ---- Opcode expected argument counts ------------------------------------ */
@@ -61,6 +62,7 @@ static const uint32_t opcode_expected_argc[OP_INVALID] = {
     [OP_INTROSPECT] = 0,   /* No args — prints full MMIO map          */
     [OP_WAIT_EVENT] = 0,   /* No args — yields until next event       */
     [OP_RESPOND]   = 0,   /* Optional goal label in args[0]          */
+    [OP_MODEL_CALL]= 0,   /* Payload in model_input field, not args   */
 };
 
 /* ---- Helper: parse hex or decimal string to uint64 --------------------- */
@@ -134,9 +136,9 @@ bool verifier_check(const ast_node_t *node, uint32_t caps)
     uint32_t required = opcode_required_caps[node->opcode];
     if ((caps & required) != required) return false;
 
-    /* 3. Argument count — OP_RESPOND accepts 0 or 1 (optional goal label) */
-    if (node->opcode == OP_RESPOND) {
-        if (node->argc > 1U) return false;
+    /* 3. Argument count */
+    if (node->opcode == OP_RESPOND || node->opcode == OP_MODEL_CALL) {
+        if (node->argc > 1U) return false;   /* optional label only */
     } else {
         if (node->argc != opcode_expected_argc[node->opcode]) return false;
     }
@@ -221,8 +223,12 @@ bool verifier_check_pipeline(const pipeline_t *pipeline, uint32_t caps)
         uint32_t required = opcode_required_caps[step->opcode];
         if ((caps & required) != required) return false;
 
-        /* Argument count */
-        if (step->argc != opcode_expected_argc[step->opcode]) return false;
+        /* Argument count — OP_RESPOND and OP_MODEL_CALL take 0 or 1 optional args */
+        if (step->opcode == OP_RESPOND || step->opcode == OP_MODEL_CALL) {
+            if (step->argc > 1U) return false;
+        } else {
+            if (step->argc != opcode_expected_argc[step->opcode]) return false;
+        }
 
         /* OP_IF: validate condition and branch counts */
         if (step->opcode == OP_IF) {

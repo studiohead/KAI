@@ -69,6 +69,11 @@ static sandbox_ctx_t sb_ctx;
  * commands in the same session. The DAG is rebuilt per invocation. */
 static kai_interner_t kai_intern;
 
+/* Shared scratch program — reused across aiql, aiql_bind, timer_bind.
+ * Only one AIQL command runs at a time (single-threaded shell), so
+ * sharing is safe and avoids multiple 22KB static allocations. */
+static aiql_program_t g_aiql_scratch;
+
 /* ---- Command typedef must come first --------------------------------- */
 typedef struct {
     const char *name;
@@ -235,20 +240,20 @@ static void cmd_irq_bind(const char *args, ai_session_t *session)
     while (*p == ' ') p++;
 
     /* Parse pipeline string into a single-pipeline aiql_program_t */
-    static aiql_program_t bind_prog;
-    k_memset(&bind_prog, 0, sizeof(bind_prog));
+    aiql_program_t *prog_ptr = &g_aiql_scratch;
+    k_memset(prog_ptr, 0, sizeof(*prog_ptr));
 
-    if (!interpreter_parse_pipeline(p, &bind_prog.pipelines[0])) {
+    if (!interpreter_parse_pipeline(p, &prog_ptr->pipelines[0])) {
         sys_uart_write("Error parsing pipeline.\r\n", KSTRLEN("Error parsing pipeline.\r\n"), session->caps);
         return;
     }
-    if (!verifier_check_pipeline(&bind_prog.pipelines[0], session->caps)) {
+    if (!verifier_check_pipeline(&prog_ptr->pipelines[0], session->caps)) {
         sys_uart_write("Pipeline verification failed.\r\n", KSTRLEN("Pipeline verification failed.\r\n"), session->caps);
         return;
     }
-    bind_prog.pipeline_count = 1;
+    prog_ptr->pipeline_count = 1;
 
-    if (irq_register_pipeline(irq_num, &bind_prog, &sb_ctx)) {
+    if (irq_register_pipeline(irq_num, prog_ptr, &sb_ctx)) {
         irq_enable(irq_num);
         sys_uart_write("IRQ bound and enabled.\r\n", KSTRLEN("IRQ bound and enabled.\r\n"), session->caps);
     } else {
@@ -379,8 +384,7 @@ static void cmd_aiql(const char *args, ai_session_t *session)
     }
 
     /* ---- Extract -------------------------------------------------------- */
-    aiql_program_t prog;
-    aiql_err_t err = aiql_extract(aiql_json_buf, len, &prog);
+    aiql_err_t err = aiql_extract(aiql_json_buf, len, &g_aiql_scratch);
     if (err != AIQL_OK) {
         uart_puts("[aiql] extract error: ");
         uart_puts(aiql_err_str(err));
@@ -389,7 +393,7 @@ static void cmd_aiql(const char *args, ai_session_t *session)
     }
 
     /* ---- Execute -------------------------------------------------------- */
-    aiql_execute_program(&prog, &sb_ctx, session->caps);
+    aiql_execute_program(&g_aiql_scratch, &sb_ctx, session->caps);
 }
 
 
@@ -419,8 +423,8 @@ static void cmd_aiql_bind(const char *args, ai_session_t *session)
         return;
     }
 
-    static aiql_program_t bind_prog;
-    aiql_err_t err = aiql_extract(p, json_len, &bind_prog);
+    aiql_program_t *prog_ptr = &g_aiql_scratch;
+    aiql_err_t err = aiql_extract(p, json_len, prog_ptr);
     if (err != AIQL_OK) {
         uart_puts("[aiql_bind] extract error: ");
         uart_puts(aiql_err_str(err));
@@ -428,7 +432,7 @@ static void cmd_aiql_bind(const char *args, ai_session_t *session)
         return;
     }
 
-    if (!irq_register_pipeline(irq_num, &bind_prog, &sb_ctx)) {
+    if (!irq_register_pipeline(irq_num, prog_ptr, &sb_ctx)) {
         uart_puts("[aiql_bind] registration failed (bad irq or slots full)\r\n");
         return;
     }
@@ -437,7 +441,7 @@ static void cmd_aiql_bind(const char *args, ai_session_t *session)
     uart_puts("[aiql_bind] bound irq ");
     sys_uart_hex64((uint64_t)irq_num, session->caps);
     uart_puts(" goal=");
-    uart_puts(bind_prog.goal[0] ? bind_prog.goal : "(none)");
+    uart_puts(prog_ptr->goal[0] ? prog_ptr->goal : "(none)");
     uart_puts("\r\n");
 }
 
@@ -481,8 +485,8 @@ static void cmd_timer_bind(const char *args, ai_session_t *session)
         return;
     }
 
-    static aiql_program_t timer_prog;
-    aiql_err_t err = aiql_extract(p, json_len, &timer_prog);
+    aiql_program_t *prog_ptr = &g_aiql_scratch;
+    aiql_err_t err = aiql_extract(p, json_len, prog_ptr);
     if (err != AIQL_OK) {
         uart_puts("[timer_bind] extract error: ");
         uart_puts(aiql_err_str(err));
@@ -490,7 +494,7 @@ static void cmd_timer_bind(const char *args, ai_session_t *session)
         return;
     }
 
-    if (!irq_register_pipeline(IRQ_TIMER_PPI, &timer_prog, &sb_ctx)) {
+    if (!irq_register_pipeline(IRQ_TIMER_PPI, prog_ptr, &sb_ctx)) {
         uart_puts("[timer_bind] registration failed\r\n");
         return;
     }
@@ -501,7 +505,7 @@ static void cmd_timer_bind(const char *args, ai_session_t *session)
     uart_puts("[timer_bind] armed: every ");
     sys_uart_hex64((uint64_t)ms, session->caps);
     uart_puts("ms, goal=");
-    uart_puts(timer_prog.goal[0] ? timer_prog.goal : "(none)");
+    uart_puts(prog_ptr->goal[0] ? prog_ptr->goal : "(none)");
     uart_puts("\r\n");
 }
 
@@ -590,133 +594,135 @@ void kernel_main(void)
 
     uart_puts(PROMPT);
 
-        /* 7. Main Shell Loop — now with real history + Up/Down arrows */
+        /* 7. Main Shell Loop
+     *
+     * Special fast-path for "aiql": as soon as we have read "aiql " (5 chars)
+     * we switch immediately to reading into aiql_json_buf for the rest of the
+     * line. This means the 128-byte CMD_BUF_SIZE limit never applies to aiql
+     * commands, even when the full JSON is pasted in one burst.
+     */
     char buf[CMD_BUF_SIZE];
     size_t index = 0U;
 
     while (true) {
         char c = uart_getc();
 
+        /* ---- Enter / Return: dispatch the buffered command -------------- */
         if (c == '\r' || c == '\n') {
             buf[index] = '\0';
             if (index > 0U) {
-                /* Save to history */
                 k_strcpy(history[hist_idx], buf);
                 hist_idx = (hist_idx + 1) % HISTORY_SIZE;
                 if (hist_count < HISTORY_SIZE) hist_count++;
-
                 execute_command(buf, &session);
                 index = 0U;
                 hist_view = -1;
             }
             uart_puts("\r\n");
             uart_puts(PROMPT);
+            continue;
         }
-        else if ((c == '\x7F') || (c == '\x08')) {  /* backspace */
-            if (index > 0U) {
-                index--;
-                uart_puts("\b \b");
-            }
+
+        /* ---- Backspace -------------------------------------------------- */
+        if ((c == '\x7F') || (c == '\x08')) {
+            if (index > 0U) { index--; uart_puts("\b \b"); }
+            continue;
         }
-        else if (c == '\x1B') {  /* ESC sequence (arrows) */
+
+        /* ---- ESC / arrow keys ------------------------------------------- */
+        if (c == '\x1B') {
             uart_getc(); /* skip '[' */
             char dir = uart_getc();
-
-            if (dir == 'A' && hist_count > 0) {  /* UP */
+            if (dir == 'A' && hist_count > 0) {        /* UP */
                 if (hist_view < 0) hist_view = (int)hist_idx - 1;
                 else hist_view = (hist_view - 1 + HISTORY_SIZE) % HISTORY_SIZE;
-
                 k_strcpy(buf, history[hist_view]);
                 index = k_strlen(buf);
-
-                /* Redraw cleanly with ANSI (this is what fixes the backspace bug) */
-                uart_puts("\r" PROMPT);
-                uart_puts(buf);
-                uart_puts("\033[K");  /* clear to end of line */
-            }
-            else if (dir == 'B' && hist_count > 0) {  /* DOWN */
+                uart_puts("\r" PROMPT); uart_puts(buf); uart_puts("\033[K");
+            } else if (dir == 'B' && hist_count > 0) { /* DOWN */
                 if (hist_view >= 0) {
                     hist_view = (hist_view + 1) % HISTORY_SIZE;
                     if (hist_view == (int)hist_idx) {
-                        hist_view = -1;
-                        buf[0] = '\0';
-                        index = 0U;
+                        hist_view = -1; buf[0] = '\0'; index = 0U;
                     } else {
                         k_strcpy(buf, history[hist_view]);
                         index = k_strlen(buf);
                     }
-
-                    uart_puts("\r" PROMPT);
-                    uart_puts(buf);
-                    uart_puts("\033[K");
+                    uart_puts("\r" PROMPT); uart_puts(buf); uart_puts("\033[K");
                 }
             }
+            continue;
         }
-        else if (is_printable(c)) {
-            if (index < (CMD_BUF_SIZE - 1U)) {
-                buf[index++] = c;
-                uart_putc(c);
-            } else if (index == (CMD_BUF_SIZE - 1U)) {
-                /* Buffer full: if this is an aiql command, switch to the
-                 * wide JSON buffer and keep reading until braces balance. */
-                buf[index] = '\0';
-                if (k_strncmp(buf, "aiql ", 5) == 0) {
-                    /* Copy what we have so far into the JSON buf */
-                    size_t json_start = 5; /* skip "aiql " */
-                    size_t ji = 0;
-                    int depth = 0; bool started = false;
-                    /* Seed from existing buf */
-                    for (size_t si = json_start;
-                         si < CMD_BUF_SIZE - 1U && ji < AIQL_BUF_SIZE - 1U;
-                         si++) {
-                        char bc = buf[si];
-                        if (bc == '{') { depth++; started = true; }
-                        else if (bc == '}') depth--;
-                        aiql_json_buf[ji++] = bc;
-                    }
-                    /* Now keep reading from UART */
-                    uart_putc(c); /* echo the char that triggered overflow */
-                    if (c == '{') { depth++; started = true; }
-                    else if (c == '}') depth--;
-                    if (ji < AIQL_BUF_SIZE - 1U) aiql_json_buf[ji++] = c;
 
-                    while (ji < AIQL_BUF_SIZE - 1U) {
-                        char jc = uart_getc();
-                        if (jc == '\r' || jc == '\n') {
-                            if (started && depth == 0) break;
-                            aiql_json_buf[ji++] = ' ';
-                            continue;
-                        }
-                        if (jc == '\x7F' || jc == '\x08') {
-                            if (ji > 0) { ji--; uart_puts("\b \b"); }
-                            continue;
-                        }
-                        if (jc == '{') { depth++; started = true; }
-                        else if (jc == '}') depth--;
-                        aiql_json_buf[ji++] = jc;
-                        uart_putc(jc);
-                        if (started && depth == 0) break;
-                    }
-                    aiql_json_buf[ji] = '\0';
-                    uart_puts("\r\n");
+        /* ---- Printable character ---------------------------------------- */
+        if (!is_printable(c)) continue;
 
-                    /* Execute directly — bypass normal dispatch */
-                    if (started && ji > 0) {
-                        aiql_program_t prog;
-                        aiql_err_t err = aiql_extract(aiql_json_buf, ji, &prog);
-                        if (err != AIQL_OK) {
-                            uart_puts("[aiql] extract error: ");
-                            uart_puts(aiql_err_str(err));
-                            uart_puts("\r\n");
-                        } else {
-                            aiql_execute_program(&prog, &sb_ctx, session.caps);
-                        }
-                    }
-                    index = 0U;
-                    uart_puts(PROMPT);
+        buf[index++] = c;
+        uart_putc(c);
+
+        /* ---- aiql fast-path: switch to wide buffer after "aiql " -------- *
+         * Trigger as soon as index==5 and buf starts with "aiql ".          *
+         * All subsequent chars — however fast they arrive — go into          *
+         * aiql_json_buf without any 128-byte ceiling.                        */
+        if (index == 5U && k_strncmp(buf, "aiql ", 5) == 0) {
+            size_t ji = 0;
+            int    depth = 0;
+            bool   started = false;
+
+            /* Drain the rest of the line into aiql_json_buf */
+            while (ji < AIQL_BUF_SIZE - 1U) {
+                char jc = uart_getc();
+
+                if (jc == '\r' || jc == '\n') {
+                    /* Accept newline as terminator only once braces balanced */
+                    if (started && depth == 0) break;
+                    /* Otherwise it's a continuation line — keep reading */
+                    continue;
                 }
-                /* else: non-aiql command, just drop the char silently */
+                if (jc == '\x7F' || jc == '\x08') {
+                    if (ji > 0) { ji--; uart_puts("\b \b"); }
+                    continue;
+                }
+
+                uart_putc(jc);
+                if (jc == '{') { depth++; started = true; }
+                else if (jc == '}') depth--;
+                aiql_json_buf[ji++] = jc;
+
+                if (started && depth == 0) break; /* balanced — done */
             }
+            aiql_json_buf[ji] = '\0';
+            uart_puts("\r\n");
+
+            if (started && ji > 0) {
+                k_memset(&g_aiql_scratch, 0, sizeof(g_aiql_scratch));
+                aiql_err_t err = aiql_extract(aiql_json_buf, ji, &g_aiql_scratch);
+                if (err != AIQL_OK) {
+                    uart_puts("[aiql] extract error: ");
+                    uart_puts(aiql_err_str(err));
+                    uart_puts("\r\n");
+                } else {
+                    aiql_execute_program(&g_aiql_scratch, &sb_ctx, session.caps);
+                }
+            } else {
+                uart_puts("[aiql] empty or malformed JSON\r\n");
+            }
+
+            /* Save the bare "aiql" token in history for arrow-key recall */
+            k_strcpy(history[hist_idx], "aiql <json>");
+            hist_idx = (hist_idx + 1) % HISTORY_SIZE;
+            if (hist_count < HISTORY_SIZE) hist_count++;
+
+            index = 0U;
+            hist_view = -1;
+            uart_puts(PROMPT);
+            continue;
+        }
+
+        /* ---- Normal buffer full guard ----------------------------------- */
+        if (index >= CMD_BUF_SIZE - 1U) {
+            /* Non-aiql command too long — drop silently */
+            index = CMD_BUF_SIZE - 1U;
         }
     }
 }

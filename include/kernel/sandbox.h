@@ -44,6 +44,10 @@ extern "C" {
 #define SANDBOX_ARG_MAX_LEN      32U    /* Max length of a single argument string    */
 #define PIPELINE_MAX_STEPS       16U    /* Max steps in one pipeline                 */
 #define VAR_STORE_SIZE           8U     /* Max named variables per pipeline run      */
+#define MODEL_INPUT_MAX_LEN     64U   /* Input key/label stored per node           */
+#define MODEL_INPUT_POOL_LEN   512U   /* Shared pool for full input text           */
+#define MODEL_RESULT_MAX_LEN   128U   /* Max text result returned from host        */
+#define STR_STORE_SIZE           4U   /* Max string variable bindings per pipeline */
 
 /* ---- Opcodes ------------------------------------------------------------- */
 typedef enum {
@@ -59,7 +63,8 @@ typedef enum {
     OP_INTROSPECT = 9,  /* Print whitelisted MMIO map as name:address pairs*/
     OP_WAIT_EVENT = 10, /* Yield until next IRQ tick (stub; becomes async) */
     OP_RESPOND    = 11, /* Emit structured RESPOND:{...} JSON result packet */
-    OP_INVALID    = 12, /* Sentinel — any value >= OP_INVALID is illegal   */
+    OP_MODEL_CALL = 12, /* Call host-side LLM/classifier via EXEC: protocol  */
+    OP_INVALID    = 13, /* Sentinel — any value >= OP_INVALID is illegal     */
 } sandbox_opcode_t;
 
 /* ---- Comparison operators (BinaryExpression operators from AIQL) -------- */
@@ -110,6 +115,10 @@ typedef struct {
     pipeline_cond_t  cond;        /* OP_IF only                              */
     uint32_t         then_count;  /* OP_IF only                              */
     uint32_t         else_count;  /* OP_IF only                              */
+    /* OP_MODEL_CALL fields */
+    char             model_type[16];              /* "llm", "classifier", etc. */
+    char             model_action[SANDBOX_ARG_MAX_LEN]; /* action/prompt name  */
+    char             model_input[MODEL_INPUT_MAX_LEN];  /* text payload        */
 } pipeline_node_t;
 
 /* ---- Variable store (maps to AIQL Variable + named outputs) ------------- */
@@ -122,6 +131,17 @@ typedef struct {
 typedef struct {
     var_entry_t entries[VAR_STORE_SIZE];
 } var_store_t;
+
+/* ---- String store (text results from OP_MODEL_CALL) --------------------- */
+typedef struct {
+    char name[SANDBOX_ARG_MAX_LEN];
+    char value[MODEL_RESULT_MAX_LEN];
+    bool set;
+} str_entry_t;
+
+typedef struct {
+    str_entry_t entries[STR_STORE_SIZE];
+} str_store_t;
 
 /* ---- Pipeline (maps to AIQL PipelineStatement) -------------------------- */
 /* pipeline_t fully defined here */
@@ -174,6 +194,7 @@ typedef struct {
 
     /* ---- Intent-local variables ---- */
     var_store_t vars;
+    str_store_t str_vars;   /* string results from OP_MODEL_CALL */
 
 } sandbox_ctx_t;
 
@@ -192,6 +213,11 @@ sandbox_result_t sandbox_execute(sandbox_ctx_t *ctx, const char *input);
  *        "read 0x40000000 4 -> data; caps"
  */
 sandbox_result_t sandbox_run_pipeline(sandbox_ctx_t *ctx, const char *input);
+
+/* String variable store helpers */
+bool str_store_set(str_store_t *store, const char *name, const char *value);
+bool str_store_get(const str_store_t *store, const char *name,
+                   char *out, size_t max);
 
 /* Human-readable result string. Never returns NULL. */
 const char *sandbox_result_str(sandbox_result_t result);

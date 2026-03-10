@@ -53,7 +53,7 @@ extern "C" {
 #define GICC_EOIR       (GICC_BASE + 0x010U)   /* End of interrupt         */
 
 /* ---- Configuration ------------------------------------------------------ */
-#define IRQ_PIPELINE_SLOTS   8U    /* Max IRQ-to-pipeline bindings           */
+#define IRQ_PIPELINE_SLOTS   4U    /* Max IRQ-to-pipeline bindings           */
 #define IRQ_MAX_SPI          96U   /* Max SPI IRQ number supported           */
 
 /* ---- ARM Generic Timer (PPI IRQ 27) ------------------------------------- */

@@ -214,6 +214,13 @@ static const op_entry_t OP_TABLE[] = {
     { "wait",        OP_SLEEP      },
     { "el",          OP_EL         },
     { "nop",         OP_NOP        },
+    { "respond",     OP_RESPOND    },
+    { "report",      OP_RESPOND    },
+    { "result",      OP_RESPOND    },
+    { "model_call",  OP_MODEL_CALL },
+    { "model",       OP_MODEL_CALL },
+    { "classify",    OP_MODEL_CALL },
+    { "infer",       OP_MODEL_CALL },
 };
 #define OP_TABLE_LEN (sizeof(OP_TABLE)/sizeof(OP_TABLE[0]))
 
@@ -375,14 +382,30 @@ static bool build_step(const char *obj, const char *oend,
     }
 
     if (is_model) {
-        /* Echo: [call_type:action] */
-        step->opcode=OP_ECHO; step->argc=1;
-        char *d=step->args[0]; size_t di=0;
-        d[di++]='[';
-        for (size_t i=0;ct[i]&&di<SANDBOX_ARG_MAX_LEN-3;i++) d[di++]=ct[i];
-        d[di++]=':';
-        for (size_t i=0;name[i]&&di<SANDBOX_ARG_MAX_LEN-2;i++) d[di++]=name[i];
-        d[di++]=']'; d[di]='\0';
+        /* Real OP_MODEL_CALL — populate model fields from AIQL CallStatement */
+        step->opcode = OP_MODEL_CALL;
+        step->argc   = 0;
+
+        copy_str(step->model_type,   ct[0]   ? ct   : "llm",
+                 sizeof(step->model_type),   ct   + sizeof(step->model_type));
+        copy_str(step->model_action, name[0] ? name : "call",
+                 sizeof(step->model_action), name + sizeof(step->model_action));
+
+        /* Extract params inline — pobj not yet declared at this point */
+        {
+            const char *mp = find_obj(obj, osize, "params");
+            const char *me = mp ? obj_end(mp, obj + osize) : (void *)0;
+            size_t      msz = (mp && me) ? (size_t)(me - mp) : 0U;
+            if (msz > 0) {
+                char inp[MODEL_INPUT_MAX_LEN] = {0};
+                get_str(mp, msz, "input",  inp, sizeof(inp));
+                if (!inp[0]) get_str(mp, msz, "prompt", inp, sizeof(inp));
+                if (!inp[0]) get_str(mp, msz, "text",   inp, sizeof(inp));
+                if (!inp[0]) get_str(mp, msz, "query",  inp, sizeof(inp));
+                copy_str(step->model_input, inp, MODEL_INPUT_MAX_LEN,
+                         inp + MODEL_INPUT_MAX_LEN);
+            }
+        }
         return true;
     }
 
@@ -442,6 +465,20 @@ static bool build_step(const char *obj, const char *oend,
             step->argc=1;
             u64_str(ms, num_buf);
             copy_str(step->args[0], num_buf, SANDBOX_ARG_MAX_LEN, num_buf+20);
+            break;
+        }
+        case OP_RESPOND: {
+            /* Optional goal label from params.goal or params.label */
+            step->argc = 0;
+            if (psz) {
+                char goal[SANDBOX_ARG_MAX_LEN] = {0};
+                get_str(pobj, psz, "goal",  goal, sizeof(goal));
+                if (!goal[0]) get_str(pobj, psz, "label", goal, sizeof(goal));
+                if (goal[0]) {
+                    copy_str(step->args[0], goal, SANDBOX_ARG_MAX_LEN, goal+sizeof(goal));
+                    step->argc = 1;
+                }
+            }
             break;
         }
         case OP_ECHO: {
