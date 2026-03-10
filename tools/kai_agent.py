@@ -754,8 +754,19 @@ def run_agent(goal, sock, provider, model, max_steps, dump_aiql, verbose, api_ke
             log_kernel(line)
         output_text = "\n".join(output_lines) if output_lines else "(no output)"
 
-        # ── Parse RESPOND: packet if present ──────────────────────────────
+        # ── Collect reflex packets first, then merge with inline output ──
+        # Drain early so a RESPOND: that arrived via IRQ reflex (because the
+        # chunked send delayed inline delivery) is never lost.
+        reflex_packets = drain_reflexes()
+        if reflex_packets:
+            print(c(f"  [reflexes] {len(reflex_packets)} packet(s) from IRQ handlers", C.AIQL))
+
+        # ── Parse RESPOND: — check inline output first, fall back to reflex ─
         respond_data = parse_respond(output_lines)
+        if not respond_data and reflex_packets:
+            # Pick the first reflex packet that looks like a RESPOND result
+            respond_data = reflex_packets[0]
+            reflex_packets = reflex_packets[1:]
         if respond_data:
             print(c(f"  [respond] {json.dumps(respond_data)}", C.AIQL))
 
@@ -771,12 +782,6 @@ def run_agent(goal, sock, provider, model, max_steps, dump_aiql, verbose, api_ke
                 passed = evaluate_success_metric(metric, context)
                 status = "PASS" if passed else "FAIL"
                 print(c(f"  [metric] {metric} → {status}", C.AIQL))
-
-        # ── Feed result back ───────────────────────────────────────────────
-        # ── Collect any IRQ-fired reflex packets ──────────────────────────
-        reflex_packets = drain_reflexes()
-        if reflex_packets:
-            print(c(f"  [reflexes] {len(reflex_packets)} packet(s) from IRQ handlers", C.AIQL))
 
         messages.append({"role": "assistant", "content": raw})
 
