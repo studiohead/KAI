@@ -1,5 +1,3 @@
-<img width="1243" height="677" alt="image" src="https://github.com/user-attachments/assets/a41170a0-d8d6-4c25-93f7-77d6aa7141c0" />
-
 # KAI — Kernel AI
 
 How do you give an AI model meaningful control over a system without giving it arbitrary code execution?
@@ -24,6 +22,7 @@ KAI is a formally verified, capability-gated, pipeline-based command language th
 - [KAI Script Compiler](#kai-script-compiler)
 - [AIQL Integration](#aiql-integration)
 - [KAI Kernel IR](#kai-kernel-ir)
+- [kai_agent — LLM Agent Bridge](#kai_agent--llm-agent-bridge)
 - [KAI as the Robot Brain](#kai-as-the-robot-brain)
 - [Author](#author)
 - [License](#license)
@@ -49,6 +48,11 @@ KAI is a formally verified, capability-gated, pipeline-based command language th
 - **New opcodes**: `sleep` (timer-based delay), `introspect` (MMIO map query), `wait_event` (WFE yield stub)
 - **KAI Script Compiler** — host-side Python tool compiles `.kai` scripts to pipeline strings
 - **KAI Kernel IR** — a true DAG runtime above the sandbox: `kai_node` (computation atom with structural hash), `kai_interner` (canonical node factory with deduplication), `kai_dag` (graph container with cycle detection), `kai_scheduler` (topological sort into parallel execution stages with AIQL cost-driven ordering)
+- **`OP_RESPOND`** — structured `RESPOND:{...}` JSON packet emitted over UART; agent bridge parses typed values (caps, EL, var store) instead of raw text
+- **`OP_MODEL_CALL` / kai_executor** — synchronous host-side model call via `EXEC:` / `RESULT:` protocol; kernel blocks on UART until the bridge returns an inference result; result stored in var store for pipeline branching
+- **AIQL shell command** — `aiql <json>` accepts full AIQL Program JSON directly; 4 KB wide-read path bypasses the 128-byte shell buffer; fast-path activates on the 5th character to handle paste without drops
+- **Timer reflexes** — `timer_bind <ms> <json>` arms the ARM generic timer (PPI 27) to fire an AIQL program on a repeating interval; IRQ handler runs the full pipeline including `RESPOND:` packets
+- **`kai_agent.py`** — LLM agent bridge: connects to the kernel over a Unix socket, generates AIQL programs, intercepts `EXEC:` packets mid-stream for real model calls, parses `RESPOND:` packets as structured feedback; `--mock` mode runs without an API key
 
 ---
 
@@ -85,16 +89,17 @@ kai_os/
 │   ├── kai_interner.c      # Node interning: FNV-1a hash table, pool allocator, retain/release
 │   ├── kai_node.c          # Structural hash (FNV-1a) and deep equality for node identity
 │   ├── kai_scheduler.c     # Level-based topo sort, stage generation, cheap-first cost sort
+│   ├── aiql.c              # AIQL JSON extractor, OP_MODEL_CALL/OP_RESPOND builder, aiql_execute_program
 │   ├── kernel.c            # kernel_main, AI session, command shell
-│   ├── irq.c               # GIC-400 driver, IRQ-to-pipeline dispatch table
+│   ├── irq.c               # GIC-400 driver, IRQ-to-pipeline dispatch table, timer reflex engine
 │   ├── memory.c            # Memory regions, sys_mem_info, sys_mem_read
 │   ├── mmu.c               # Page table construction, identity map
 │   ├── syscall.c           # sys_uart_write, sys_uart_hex64
 │   └── uart.c              # PL011 UART driver
 ├── tools/
-│   ├── api_to_kai.py       # AIQL AST to KAI pipeline compiler
-│   ├── kai_agent.py        # KAI/LLM agent bridge (AIQL-native)
+│   ├── kai_agent.py        # LLM agent bridge — AIQL generation, EXEC:/RESULT: dispatch, RESPOND: parsing
 │   ├── kai_compiler.py     # Host-side .kai script compiler
+│   ├── aiql_to_kai.py      # AIQL JSON AST → KAI pipeline string compiler
 │   └── examples/
 │       ├── obstacle_avoid.kai
 │       └── timed_sequence.kai
@@ -144,6 +149,10 @@ make clean        # remove build/
 | `dag <steps>` | Build a DAG from a pipeline, run the scheduler, and print the execution plan |
 | `irq_init` | Enable CPU-level IRQ delivery (activate hardware reflexes) |
 | `irq_bind <num> <pipeline>` | Bind a pipeline to a hardware interrupt number |
+| `aiql_bind <irq> <json>` | Bind an AIQL JSON program to a hardware interrupt |
+| `timer_bind <ms> <json>` | Arm the ARM generic timer to fire an AIQL program every N ms |
+| `irq_list` | List all active IRQ bindings with fire counts and goals |
+| `aiql <json>` | Parse and execute an AIQL Program JSON directly |
 
 ---
 
@@ -163,6 +172,8 @@ The sandbox accepts: `<opcode> [arg0] [arg1]`
 | `sleep <ms>` | Busy-wait for N milliseconds (0–10000, uses CNTPCT_EL0) |
 | `introspect` | Print whitelisted MMIO address map |
 | `wait_event` | Yield via WFE (stub — becomes async in future) |
+| `respond [goal]` | Emit `RESPOND:{...}` JSON packet with caps, EL, and full var store |
+| `model_call` | Dispatch `EXEC:{...}` to host bridge and block-read `RESULT:{...}` |
 
 Single-shot examples:
 ```
@@ -512,9 +523,66 @@ KAI's pipeline engine is derived from the AIQL AST schema:
 | `Variable` | `var_entry_t` in `var_store_t` |
 | `Literal` | `uint64_t` inline in `operand_t` |
 
-Certain AIQL AST types are intentionally omitted (require hosted OS capabilities):
-- `CallStatement` (model / visualize)
+Additional AIQL AST types now implemented:
+
+| AIQL Schema Type | KAI OS Implementation |
+|---|---|
+| `CallStatement` (llm / classifier) | `OP_MODEL_CALL` — EXEC:/RESULT: protocol via kai_executor bridge |
+| `RespondWithResult` operation | `OP_RESPOND` — structured JSON packet with caps, EL, and var store |
+
+Still omitted (require hosted OS capabilities):
 - `LoadStatement` (requires filesystem / network)
+
+---
+
+## kai_agent — LLM Agent Bridge
+
+`tools/kai_agent.py` connects a language model to the KAI kernel over a Unix socket. It drives the full autonomous loop: generate AIQL → send to kernel → parse `RESPOND:` → feed back to LLM → repeat.
+
+### Architecture
+
+```
+User goal (natural language)
+      ↓
+LLM generates AIQL JSON program   ← structured, auditable intent
+      ↓
+kai_agent sends via Unix socket → QEMU serial → KAI kernel
+      ↓  verifier + DAG + scheduler + executor
+UART output
+      ↓
+kai_agent parses RESPOND: packet  ← typed values, not raw text
+      ↓
+LLM reasons on structured result, replans or declares done
+```
+
+### Running
+
+```bash
+# Terminal 1 — kernel (headless, serial on Unix socket)
+make run-agent
+
+# Terminal 2 — agent (mock mode, no API key required)
+python3 tools/kai_agent.py --mock
+
+# With a real LLM
+export ANTHROPIC_API_KEY=sk-...
+python3 tools/kai_agent.py --goal "inspect hardware and report system state"
+python3 tools/kai_agent.py --provider openai --goal "write 0xAB to scratch and verify"
+```
+
+### kai_executor — Host-Side Model Calls
+
+When a pipeline contains `OP_MODEL_CALL`, the kernel emits an `EXEC:` packet and blocks on UART. The agent intercepts this mid-stream, makes the actual API call, and writes `RESULT:` back. The kernel resumes with the result stored in the variable store.
+
+```
+kernel → EXEC:{"type":"llm","action":"classify","input":"...","output_var":"label"}
+bridge →                                    [API call]
+bridge → RESULT:{"value":"obstacle_detected"}
+kernel → stores "obstacle_detected" in var store under "label"
+kernel → pipeline continues; OP_IF can branch on label
+```
+
+This makes the full sense → infer → act loop possible inside a single AIQL pipeline, with no round-trips through the shell.
 
 ---
 
