@@ -309,9 +309,15 @@ def drain(sock):
         pass
     sock.settimeout(0.1)
 
-def send_command(sock, cmd) -> list:
+def send_command(sock, cmd, provider="", model="", api_key="") -> list:
     drain(sock)
-    sock.sendall((cmd + "\r\n").encode())
+    # Send in small chunks with pauses — the kernel reads one char at a time
+    # via uart_getc() and the QEMU serial FIFO drops bytes if overwhelmed.
+    payload = (cmd + "\r\n").encode()
+    chunk_size = 32
+    for i in range(0, len(payload), chunk_size):
+        sock.sendall(payload[i:i+chunk_size])
+        time.sleep(0.01)   # 10ms between chunks — kernel processes ~3200 chars/sec
     raw = recv_until_prompt(sock, timeout=20.0)
     lines = []
     for line in raw.splitlines():
@@ -559,6 +565,8 @@ def call_openai(messages, model):
     return resp.choices[0].message.content
 
 def call_llm(messages, provider, model):
+    if provider == "mock":
+        return call_llm_mock(messages)
     if provider == "anthropic":
         return call_claude(messages, model)
     elif provider == "openai":
@@ -581,15 +589,75 @@ def parse_response(text):
     raise ValueError(f"Could not parse LLM response as JSON.\n\nRaw response:\n{text}")
 
 
+
+# ── Mock LLM ─────────────────────────────────────────────────────────────────
+# A scripted response sequence for testing without an API key.
+# Steps through MOCK_SCRIPT in order; repeats the last entry if exhausted.
+
+MOCK_SCRIPT = [
+    # Step 1: introspect caps and EL, emit RESPOND
+    {
+        "thought": "[mock] Step 1: query system capabilities and exception level.",
+        "done": False,
+        "aiql": {
+            "type": "Program",
+            "intent": {"goal": "inspect_hardware"},
+            "body": [{
+                "type": "PipelineStatement",
+                "steps": [
+                    {"type": "Operation", "name": "GetCaps"},
+                    {"type": "Operation", "name": "GetExceptionLevel"},
+                    {"type": "Operation", "name": "RespondWithResult",
+                     "params": {"goal": "hardware_state"}}
+                ]
+            }]
+        }
+    },
+    # Step 2: write a byte to scratch, read it back, respond
+    {
+        "thought": "[mock] Step 2: write 0xAB to scratch offset 0 and verify.",
+        "done": False,
+        "aiql": {
+            "type": "Program",
+            "intent": {"goal": "scratch_rw"},
+            "body": [{
+                "type": "PipelineStatement",
+                "steps": [
+                    {"type": "Operation", "name": "WriteScratch",
+                     "params": {"offset": 0, "value": "0xAB"}},
+                    {"type": "Operation", "name": "RespondWithResult",
+                     "params": {"goal": "scratch_verified"}}
+                ]
+            }]
+        }
+    },
+    # Step 3: declare done
+    {
+        "thought": "[mock] System state confirmed. Goal achieved.",
+        "done": True,
+        "conclusion": "Hardware introspection complete. Caps=0xf, EL=1, scratch r/w verified."
+    },
+]
+
+_mock_step = 0
+
+def call_llm_mock(messages):
+    global _mock_step
+    entry = MOCK_SCRIPT[min(_mock_step, len(MOCK_SCRIPT) - 1)]
+    _mock_step += 1
+    return json.dumps(entry)
+
+
 # ── Agent loop ───────────────────────────────────────────────────────────────
 
-def run_agent(goal, sock, provider, model, max_steps, dump_aiql, verbose):
+def run_agent(goal, sock, provider, model, max_steps, dump_aiql, verbose, api_key=""):
     print()
     print(c("═" * 60, C.DIM))
     print(c("  KAI OS — AIQL Agent", C.BOLD))
     print(c("═" * 60, C.DIM))
     print(c(f"  Goal     : ", C.DIM) + goal)
-    print(c(f"  Provider : {provider} / {model}", C.DIM))
+    mock_tag = " [MOCK — no API calls]" if provider == "mock" else ""
+    print(c(f"  Provider : {provider} / {model}{mock_tag}", C.DIM))
     print(c(f"  Budget   : {max_steps} steps", C.DIM))
     print(c("═" * 60, C.DIM))
 
@@ -748,8 +816,9 @@ def run_agent(goal, sock, provider, model, max_steps, dump_aiql, verbose):
 # ── Entry point ──────────────────────────────────────────────────────────────
 
 DEFAULT_MODELS = {
-    "anthropic": "claude-opus-4-5",
+    "anthropic": "claude-sonnet-4-6",
     "openai":    "gpt-4o",
+    "mock":      "mock",
 }
 
 def main():
@@ -760,14 +829,17 @@ def main():
         epilog=textwrap.dedent("""
             Examples:
               make run-agent
+              python3 tools/kai_agent.py --mock                          # no API key needed
               python3 tools/kai_agent.py --goal "inspect hardware and report system state"
               python3 tools/kai_agent.py --goal "write 0xAB to scratch offset 3 and verify"
               python3 tools/kai_agent.py --dump-aiql --goal "run a timed pipeline"
               python3 tools/kai_agent.py --provider openai --goal "query capabilities"
         """)
     )
-    parser.add_argument("--goal",       required=True)
-    parser.add_argument("--provider",   default="anthropic", choices=["anthropic", "openai"])
+    parser.add_argument("--goal",       default="inspect hardware and report system state")
+    parser.add_argument("--provider",   default="anthropic", choices=["anthropic", "openai", "mock"])
+    parser.add_argument("--mock",       action="store_true",
+                        help="Use scripted mock LLM — no API key required")
     parser.add_argument("--model",      default=None)
     parser.add_argument("--socket",     default="/tmp/kai.sock")
     parser.add_argument("--max-steps",  type=int, default=10)
@@ -780,7 +852,9 @@ def main():
     if args.no_color:
         USE_COLOR = False
 
-    model = args.model or DEFAULT_MODELS[args.provider]
+    if args.mock:
+        args.provider = "mock"
+    model = args.model or DEFAULT_MODELS.get(args.provider, "mock")
 
     try:
         sock = connect_socket(args.socket)
@@ -793,6 +867,7 @@ def main():
             max_steps=args.max_steps,
             dump_aiql=args.dump_aiql,
             verbose=args.verbose,
+            api_key=os.environ.get("ANTHROPIC_API_KEY", "") or os.environ.get("OPENAI_API_KEY", ""),
         )
         stop_reflex_listener()
         sock.close()
